@@ -1,0 +1,3679 @@
+### ATTEMPT AT DETAILED DEBUG AND PLOT VERSION OF RT - WITH COLLAPSED TURNS
+
+### new v+ inference version 3 **PLUS  !
+
+
+import os
+import time
+import pickle
+import h5py
+import numpy as np
+import onnx
+import onnxruntime as ort
+import matplotlib.pyplot as plt
+from pathlib import Path
+from tqdm import tqdm
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, accuracy_score, precision_score, recall_score, f1_score
+from scipy.stats import mode
+import psutil
+from collections import Counter, defaultdict
+import argparse
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import pandas as pd
+from scipy.ndimage import (
+    gaussian_filter1d,
+    uniform_filter1d,
+    binary_dilation,
+    binary_erosion,
+)
+from scipy.signal import medfilt, butter, filtfilt, savgol_filter, find_peaks, lfilter, lfilter_zi
+from scipy.ndimage import label
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    precision_score,
+    recall_score,
+    f1_score
+)
+
+class_index_to_label_predfog = ["Non-predFOG", "predFOG"]
+
+target_names_motor_states = [
+  "Sitting",
+  "Standing",
+  "SitToStand",
+  "StandToSit",
+  "Turn_Left",
+  "Turn_Right",
+  "Walking"
+]
+
+target_names_predfog = class_index_to_label_predfog
+
+
+# Load the ONNX model with error handling
+def load_onnx_model(model_path):
+    try:
+        model = onnx.load(model_path)
+        onnx.checker.check_model(model)
+        print(f"Model loaded and checked successfully from {model_path}")
+        return model
+    except Exception as e:
+        print(f"Error loading ONNX model from {model_path}: {e}")
+        return None
+
+# Create an inference session for the ONNX model with error handling
+def create_onnx_session(model_path):
+    try:
+        session = ort.InferenceSession(model_path)
+        print(f"Inference session created successfully for model: {model_path}")
+        return session
+    except Exception as e:
+        print(f"Error creating inference session for {model_path}: {e}")
+        return None
+
+# Prepare input for ONNX model (ensure data is float32 and correct shape if needed)
+def prepare_input_for_onnx(input_data):
+    if not isinstance(input_data, np.ndarray):
+        input_data = np.array(input_data)
+    return input_data.astype(np.float32)
+
+# Run inference on ONNX model with 3 named outputs
+def infer_onnx(session, data):
+    input_name = session.get_inputs()[0].name
+    try:
+        output_names = [
+            "locomotion_output",
+            "turn_direction_output",
+            "pred_fog_output"
+        ]
+        outputs = session.run(output_names, {input_name: data})
+        return outputs  # Returns all 3 outputs in a tuple
+    except Exception as e:
+        print(f"Error during inference: {e}")
+        return [None] * 3
+
+
+# Convert indices to label names based on provided mapping
+def convert_indices_to_labels(indices, label_mapping):
+    return [label_mapping[index] for index in indices]
+
+# functions needed  -------------------------------------------------------
+def butter_lowpass_filter(data, cutoff=0.75, fs=30, order=4):
+    nyq = 0.5 * fs
+    b, a = butter(order, cutoff / nyq, btype="low", analog=False)
+    return filtfilt(b, a, data)
+
+def butter_lowpass_filter_with_state(data, cutoff=0.3, fs=30, order=3, zi=None):
+    b, a = butter(order, cutoff / (0.5 * fs), btype='low')
+    if zi is None:
+        zi = lfilter_zi(b, a) * data[0]
+    y, zf = lfilter(b, a, data, zi=zi)
+    return y, zf
+
+def smooth_binary(binary_array, window_size=9):
+    return uniform_filter1d(binary_array.astype(float), size=window_size)
+
+def pad_binary_regions(signal: np.ndarray, pre_pad: int = 5, post_pad: int = 5):
+    padded = signal.copy()
+    ones = np.where(signal == 1)[0]
+    for idx in ones:
+        padded[max(0, idx - pre_pad): idx + post_pad + 1] = 1
+    return padded
+
+def mask_long_enough(signal: np.ndarray, min_len: int = 15):
+    signal = signal.astype(int)
+    out = np.zeros_like(signal)
+    labeled, n = label(signal)
+    for i in range(1, n + 1):
+        idx = np.where(labeled == i)[0]
+        if len(idx) >= min_len:
+            out[idx] = 1
+    return out
+
+def sustain_gate(mask, min_frames):
+    gate = np.zeros_like(mask)
+    labeled, n = label(mask)
+    for i in range(1, n + 1):
+        indices = np.where(labeled == i)[0]
+        if len(indices) >= min_frames:
+            gate[indices] = 1
+    return gate.astype(bool)
+
+def compute_displacement_signal(x, y, window_size=30, smooth=True, smoothing_size=15):
+
+    coords = np.stack([x, y], axis=-1)
+    disp = np.full(len(x), np.nan)
+
+    for i in range(window_size, len(x)):
+        path = coords[i - window_size:i + 1]
+        disp[i] = np.sum(np.linalg.norm(np.diff(path, axis=0), axis=1))
+
+    if smooth:
+        disp = np.nan_to_num(disp)
+        disp = uniform_filter1d(disp, size=smoothing_size, mode='nearest')
+
+    return disp
+
+def clean_displacement(disp, threshold=3.0):
+    disp = np.array(disp)
+    disp[np.abs(disp) > threshold] = np.nan
+    return disp
+
+def interpolate_nan(disp):
+    isnan = np.isnan(disp)
+    not_nan = ~isnan
+    disp[isnan] = np.interp(np.flatnonzero(isnan), np.flatnonzero(not_nan), disp[not_nan])
+    return disp
+
+def smooth_displacement(disp, window=15):
+    return uniform_filter1d(disp, size=window, mode='nearest')
+
+def process_displacement_signal(disp_raw, clip_thresh=3.0, smooth_win=15, aggressive=True):
+
+    disp = clean_displacement(disp_raw, threshold=clip_thresh)
+    disp = interpolate_nan(disp)
+    disp = smooth_displacement(disp, window=smooth_win)
+
+    if aggressive:
+        # Use percentile to define reasonable upper bound (e.g., 99.5th percentile)
+        upper = np.percentile(disp, 99.5)
+        median = np.median(disp)
+
+        # Apply adaptive log compression to all values above median
+        disp = np.where(disp > median, median + np.log1p(disp - median) / np.log(3), disp)
+
+        # Optionally hard cap above extreme threshold
+        disp = np.clip(disp, 0, upper)
+
+    return disp
+
+def compute_jitter_index(ht_smoothed, window_size=15, step=1):
+
+    # Third derivative
+    third_derivative = np.diff(ht_smoothed, n=3)
+
+    # Replace NaNs/Infs in third derivative
+    if np.isnan(third_derivative).all():
+        third_derivative = np.zeros_like(third_derivative)
+    else:
+        third_derivative = np.nan_to_num(third_derivative, nan=np.nanmean(third_derivative))
+
+    jitter_vals = []
+    for start in range(0, len(third_derivative) - window_size + 1, step):
+        window = third_derivative[start : start + window_size]
+        if np.isnan(window).any() or np.isinf(window).any():
+            window = np.nan_to_num(window, nan=0.0, posinf=0.0, neginf=0.0)
+        jitter = np.sqrt(np.mean(window**2))  # RMS
+        jitter_vals.append(jitter)
+
+    # Pad beginning to align output length
+    padding = [jitter_vals[0]] * (window_size + 2)  # +2 for 3rd derivative shift
+    jitter_feature = np.array(padding + jitter_vals)
+
+    # Final cleanup
+    jitter_feature = np.nan_to_num(jitter_feature, nan=0.0, posinf=0.0, neginf=0.0)
+
+    return jitter_feature
+
+def baseline_scale(feature):
+    p_min = np.percentile(feature, 0)
+    p_max = np.percentile(feature, 100)
+    denom = p_max - p_min if p_max - p_min != 0 else 1.0
+    return (np.clip((feature - p_min) / denom, 0, 1))*10
+
+def ema(x, alpha=0.2):
+    result = np.zeros_like(x)
+    result[0] = x[0]
+    for t in range(1, len(x)):
+        result[t] = alpha * x[t] + (1 - alpha) * result[t-1]
+    return result
+
+def feature_engineering(input_data_seq):
+    """
+    Applies feature engineering to each [T, 3] window in sequence-shaped input [N, T, 3].
+    Ensures all features are computed locally, emulating real-time conditions.
+    
+    Returns:
+    - output_seq:       [N, T, 4]  (features: ht_smoothed, ang_vel_L, ang_vel_R, smooth_velocity)
+    - smooth_velocity:  [N, T]
+    - ht_smoothed:      [N, T]
+    - ang_vel_sm_l:     [N, T]
+    - ang_vel_sm_r:     [N, T]
+    """
+    N, T, D = input_data_seq.shape
+    assert D >= 3, "Expected at least 3 input features (vel, ht, cam_ang)"
+
+    output_seq = []
+    smooth_velocity_all = []
+    ht_smoothed_all = []
+    ang_vel_sm_l_all = []
+    ang_vel_sm_r_all = []
+    
+    zi_angle = None
+
+    for window in input_data_seq:
+        velocity_XZ = np.nan_to_num(window[:, 0])
+        ht = np.nan_to_num(window[:, 1])
+        cam_ang = np.nan_to_num(window[:, 2])
+
+        # Smoothed height
+        ht_smoothed = gaussian_filter1d(ht, sigma=1)
+
+        #velocity_XZ = ema(velocity_XZ, alpha = 0.01)
+
+        # Angular velocity
+        delta_ang = np.diff(cam_ang, prepend=cam_ang[0])
+        delta_ang = np.degrees(np.arctan2(np.sin(np.radians(delta_ang)), np.cos(np.radians(delta_ang))))
+        delta_ang[np.abs(delta_ang) < 0.3] = 0.0
+
+        ang_vel_smoothed, zi_angle = butter_lowpass_filter_with_state(delta_ang, cutoff=0.3, fs=30, order=3, zi=zi_angle)
+        ang_vel_smoothed = pd.Series(ang_vel_smoothed).rolling(window=15, center=True, min_periods=1).mean().values
+
+        ang_vel_smoothed = np.where(np.abs(ang_vel_smoothed) >= 0.03, ang_vel_smoothed, 0.0)
+        ang_vel_smoothed = np.clip(ang_vel_smoothed, -1.0, 1.0)
+
+        ang_vel_sm_l = ((ang_vel_smoothed < -0.15) * -ang_vel_smoothed > 0.4).astype(float)
+        ang_vel_sm_r = ((ang_vel_smoothed >  0.25) *  ang_vel_smoothed > 0.4).astype(float)
+
+        # Smoothed velocity
+        smooth_velocity = (
+            pd.Series(velocity_XZ)
+            .rolling(window=5, center=True, min_periods=1)
+            .mean()
+            .interpolate(method='linear', limit_direction='both')
+            .fillna(0.0)
+            .to_numpy()
+        )
+        smooth_velocity = np.clip(smooth_velocity, 0, 1)
+
+        # Stack features
+        features = np.column_stack([
+            ht_smoothed,
+            ang_vel_sm_l,
+            ang_vel_sm_r,
+            smooth_velocity
+        ]).astype(np.float32)
+
+        output_seq.append(features)
+        smooth_velocity_all.append(smooth_velocity)
+        ht_smoothed_all.append(ht_smoothed)
+        ang_vel_sm_l_all.append(ang_vel_sm_l)
+        ang_vel_sm_r_all.append(ang_vel_sm_r)
+
+    # Convert to arrays
+    output_seq = np.stack(output_seq)
+    smooth_velocity_seq = np.stack(smooth_velocity_all)
+    ht_smoothed_seq = np.stack(ht_smoothed_all)
+    ang_vel_sm_l_seq = np.stack(ang_vel_sm_l_all)
+    ang_vel_sm_r_seq = np.stack(ang_vel_sm_r_all)
+
+    print(f"✅ Per-window feature_engineering output: {output_seq.shape}")
+
+    return output_seq, smooth_velocity_seq, ht_smoothed_seq, ang_vel_sm_l_seq, ang_vel_sm_r_seq
+
+
+def suppress_short_segments(states: np.ndarray, min_len: int = 5):
+    """
+    Replaces consecutive runs shorter than min_len by the surrounding dominant state.
+    """
+    states = np.asarray(states)
+    if len(states) == 0:
+        return states
+
+    new_states = states.copy()
+    n = len(states)
+    start_idx = 0
+
+    for idx in range(1, n):
+        if states[idx] != states[start_idx]:
+            run_len = idx - start_idx
+            if run_len < min_len:
+                # Choose replacement: use previous if exists and not equal, else next
+                prev_state = states[start_idx - 1] if start_idx > 0 else None
+                next_state = states[idx] if idx < n else None
+
+                if prev_state is not None and prev_state != states[start_idx]:
+                    replacement = prev_state
+                elif next_state is not None and next_state != states[start_idx]:
+                    replacement = next_state
+                else:
+                    # fallback: use prev_state if exists else keep as-is
+                    replacement = prev_state if prev_state is not None else states[start_idx]
+
+                new_states[start_idx:idx] = replacement
+
+            start_idx = idx
+
+    # Handle final run
+    run_len = n - start_idx
+    if run_len < min_len and start_idx > 0:
+        prev_state = new_states[start_idx - 1]
+        new_states[start_idx:] = prev_state
+
+
+def inject_terrain_simulation(ht_smoothed, motor_labels, num_frames_per_segment=90, seed=42):
+    """
+    Alters a copy of ht_smoothed to simulate terrain features during walking.
+    Only returns the modified version — original remains untouched.
+    """
+    # Work on a copy to avoid corrupting global signal
+    ht_injected = ht_smoothed.copy()
+
+    walking_indices = np.where(motor_labels == 8)[0]
+    walking_runs = np.split(walking_indices, np.where(np.diff(walking_indices) != 1)[0] + 1)
+    walking_runs = [run for run in walking_runs if len(run) >= num_frames_per_segment]
+
+    if len(walking_runs) < 4:
+        print(f"[WARN] Not enough long walking segments to inject terrain (found {len(walking_runs)})")
+        return ht_injected, {}
+
+    np.random.seed(seed)
+    np.random.shuffle(walking_runs)
+
+    terrain_types = ['slope_up', 'slope_down', 'stair_up', 'stair_down']
+    injected_ranges = {}
+
+    # Constants to match detection thresholds
+    dz_norm_slope = 0.10       # Smooth slope change (normalized)
+    dz_norm_step = 0.11        # Typical normalized step height per stair
+    step_interval = 25          # Frames per stair step
+    step_rise_per_frame = dz_norm_step / step_interval  # Fine-grained riser slope
+
+    print(f"[INJECT] Simulating terrain types: {terrain_types}")
+    for terrain, run in zip(terrain_types, walking_runs[:4]):
+        start = run[0]
+        end = start + num_frames_per_segment
+        if end >= len(ht_injected):
+            continue
+
+        if terrain == 'slope_up':
+            # Linear slope rise
+            slope_profile = np.linspace(0, dz_norm_slope, num_frames_per_segment)
+            ht_injected[start:end] += slope_profile
+
+        elif terrain == 'slope_down':
+            # Linear slope fall
+            slope_profile = np.linspace(0, dz_norm_slope, num_frames_per_segment)
+            ht_injected[start:end] -= slope_profile
+
+        elif terrain == 'stair_up':
+            # Stepwise riser pattern
+            for i in range(num_frames_per_segment):
+                stair_step = i // step_interval
+                ht_injected[start + i] += stair_step * dz_norm_step
+
+        elif terrain == 'stair_down':
+            # Stepwise descent pattern
+            for i in range(num_frames_per_segment):
+                stair_step = i // step_interval
+                ht_injected[start + i] -= stair_step * dz_norm_step
+
+        injected_ranges[terrain] = (start, end)
+        print(f"[INJECT] Applied {terrain} from frame {start} to {end}")
+
+    return ht_injected, injected_ranges
+
+
+def debug_plot_injection(ht_original, ht_smoothed, injected_ranges):
+    plt.figure(figsize=(12, 4))
+    plt.plot(ht_original, label='Original', alpha=0.5)
+    plt.plot(ht_smoothed, label='Injected', linewidth=2)  # <- fixed name
+
+    for terrain, (start, end) in injected_ranges.items():
+        plt.axvspan(start, end, alpha=0.2, label=f"{terrain} [{start}-{end}]")
+
+    plt.legend()
+    plt.title("Height Signal Before vs After Terrain Injection")
+    plt.xlabel("Frame Index")
+    plt.ylabel("Height")
+    plt.tight_layout()
+    plt.show()
+    
+def ema(x, alpha=0.2):
+    result = np.zeros_like(x)
+    result[0] = x[0]
+    for t in range(1, len(x)):
+        result[t] = alpha * x[t] + (1 - alpha) * result[t-1]
+    return result
+
+def stream_data_and_run_inference(
+    model,
+    sequence_length,
+    stride=30,
+    file_path=None,
+    user_seated_ht=None,
+    user_standing_ht=None,
+    user_walk_vel_ref=None,
+    ground_truth_main=None,
+    input_data=None,
+    ht_smoothed=None,
+    smooth_velocity=None,
+    stand_thresh=0.7, sit_thresh=0.21,
+    standing_vel_thresh=0.5,
+    turn_conf_thresh=0.65, loco_conf_thresh=0.10,
+    pred_fog_threshold=0.35, #was 0.35
+    local_min_duration=3,
+    sample_rate_hz=30
+):
+
+    if input_data is None or ht_smoothed is None or smooth_velocity is None:
+        if file_path is None:
+            raise ValueError("Must provide file_path if input_data not supplied.")
+        print("[EDGE-RT]  Running preprocess_data() inline...")
+        input_sequences, smooth_velocity, ht_smoothed, ang_vel_sm_l, ang_vel_sm_r, raw_ht = preprocess_data(
+            file_path,
+            sequence_length=sequence_length,
+            user_seated_ht=user_seated_ht,
+            user_standing_ht=user_standing_ht,
+            user_walk_vel_ref=user_walk_vel_ref
+        )
+        if len(input_sequences) == 0:
+            raise ValueError("[EDGE-RT] preprocess_data returned no valid sequences!")
+        input_data = input_sequences  # ← do not flatten
+        print(f"[EDGE-RT]  input_data.shape={input_data.shape}")
+    
+    # ────────────────
+    # Optional: Inject simulated terrain into walking segments
+    # ────────────────
+    if ground_truth_main is None:
+        raise ValueError("ground_truth_main must be provided to simulate terrain.")
+    
+    ht_original = ht_smoothed.copy()
+
+    # Inject terrain and get back injected frame ranges
+    ht_smoothed, injected_ranges = inject_terrain_simulation(ht_smoothed, ground_truth_main)
+
+    # Plot comparison
+    debug_plot_injection(ht_original, ht_smoothed, injected_ranges)
+
+    # ───────────── Debug Logging for Terrain ─────────────
+    print(f"[DEBUG] inject_terrain_simulation() applied to ht_smoothed of shape: {np.shape(ht_smoothed)}")
+    print(f"[DEBUG] ground_truth_main shape: {np.shape(ground_truth_main)}")
+
+    # Optional: Log count of walking frames
+    num_samples = len(ht_smoothed)
+    is_walking_gt = (ground_truth_main[:num_samples] == 8)  # Assuming class 8 = Walking
+    print(f"[DEBUG] Walking frames from GT: {np.sum(is_walking_gt)} of {num_samples}")
+
+    # Optional: Show unique GT class labels seen
+    unique_gt_labels = np.unique(ground_truth_main[:num_samples])
+    print(f"[DEBUG] Unique GT motor states in RT window: {unique_gt_labels}")
+
+    num_sequences = input_data.shape[0]
+    sequence_length = input_data.shape[1]
+    num_samples = ht_smoothed.shape[0]
+    input_dim = input_data.shape[-1]
+    original_frame_count = ht_smoothed.shape[0]
+    
+    total_steps = (num_samples - sequence_length) // stride + 1
+    total_inference_time = 0.0
+    total_loop_time = 0.0
+
+    loco_accum = np.zeros((original_frame_count, 2))
+    turn_accum = np.zeros((original_frame_count, 3))
+    predfog_accum = np.zeros(original_frame_count)
+    frame_counts = np.zeros(original_frame_count)
+
+    motor_state_series = np.full(original_frame_count, -1)
+    pred_fog_series = np.full(original_frame_count, -1)
+    posture_state_series = []
+
+    rolling_posture_state, prev_posture = None, None
+    posture_state_buffer, predfog_buffer = [], []
+    walk_prob_buffer, turnL_prob_buffer, turnR_prob_buffer = [], [], []
+    motor_state_buffer = []
+    surface_state_log = []
+
+    posture_bridge_countdown = 0
+    posture_bridge_label = None
+    expected_window_duration = stride / sample_rate_hz
+
+    class_index_to_label_main = {
+        0: 'Sitting', 1: 'Standing', 2: 'SitToStand', 3: 'StandToSit',
+        4: 'Turn_L', 5: 'Turn_R', 8: 'Walking'
+    }
+
+    last_state = None
+    state_run_len = 0
+
+    last_predfog_state = None
+    predfog_run_len = 0
+
+    floor_estimate = None
+    floor_alpha = 0.1
+    prev_floor_estimate = None
+    floor_change_buffer = []
+
+    raw_floor_estimate = None
+    raw_floor_alpha = 0.1
+    raw_prev_floor_estimate = None
+    raw_floor_change_buffer = []
+
+    prev_surface_state = 'level'
+    prev_net_ht_change = 0.0
+    
+    global_indices = []
+    
+    detected_steps = []
+    last_step_idx = -np.inf
+    step_event_series = np.zeros(num_samples, dtype=int) 
+    
+    surface_state_series = np.full(num_samples, '', dtype=object)
+
+    with tqdm(total=num_sequences, desc="Edge RT", unit="frame") as pbar:
+        for i in range(num_sequences):
+
+            window_start_time = time.time()
+            
+            # ---- Indices ----
+            base_frame_idx = i * stride
+            mid_idx = sequence_length - 1
+            frame_idx = base_frame_idx + mid_idx  # <- final frame in the sequence
+            
+            # ---- Guard against overflow ----
+            if frame_idx >= len(ht_smoothed):
+                print(f"[EDGE-RT] Skipping frame {frame_idx}, out of bounds")
+                continue
+
+            # ── Smoothed normalized head height ───────────────────────────────
+            window_ht_smooth = ht_smoothed[base_frame_idx : base_frame_idx + sequence_length]
+
+            # ── Floor estimation from smoothed window - 10th%ile good for ID of heelstrike  ───────────
+            window_floor_est = np.percentile(window_ht_smooth, 10)
+            ht_value = window_ht_smooth[-1] #ht value at end of each sequence
+
+            if floor_estimate is None:
+                floor_estimate = window_floor_est
+            else:
+                floor_estimate = floor_alpha * window_floor_est + (1 - floor_alpha) * floor_estimate
+
+            # ── Track change in floor estimate over time ──────────────────────
+            if prev_floor_estimate is not None:
+                dz_norm = floor_estimate - prev_floor_estimate
+                floor_change_buffer.append(dz_norm)
+                if len(floor_change_buffer) > 10:
+                    floor_change_buffer.pop(0)
+            else:
+                dz_norm = 0.0
+            prev_floor_estimate = floor_estimate
+
+            # ── Compute dz stats in meters (optional) ─────────────────────────
+            dz_mean_norm   = np.mean(floor_change_buffer) if floor_change_buffer else 0.0
+            dz_var_norm    = np.var(floor_change_buffer) if floor_change_buffer else 0.0
+            dz_mean_meters = dz_mean_norm * user_standing_ht
+            dz_var_meters  = dz_var_norm * (user_standing_ht ** 2)
+
+            # ── Average normalized velocity in window ─────────────────────────
+            vel_mean = np.mean(smooth_velocity[base_frame_idx : base_frame_idx + sequence_length])
+
+            # ── Use last motor and predFOG states ─────────────────────────────
+            current_motor   = motor_state_buffer[-1] if motor_state_buffer else -1
+            current_predfog = predfog_buffer[-1] if predfog_buffer else 0
+
+            # ── Simplified terrain classification ─────────────────────────────
+            ht_delta = window_ht_smooth[-1] - window_ht_smooth[0]
+            dz_trend = np.polyfit(np.arange(len(window_ht_smooth)), window_ht_smooth, 1)[0]
+
+            # ── Net vertical change and trend ───────────────────────────────
+            net_ht_change = window_ht_smooth[-1] - window_ht_smooth[0]
+            net_ht_change_meters = net_ht_change * user_standing_ht
+            abs_ht_change_meters = abs(net_ht_change_meters)
+
+            # ── Terrain Classification with Hysteresis ──────────────────────
+            surface_state = prev_surface_state  # default to previous unless clear switch
+
+            if current_predfog == 1 or current_motor in [0, 1, 2, 3]:
+                surface_state = 'ignore terrain for this state'
+
+            else:
+                # Proposed surface based on real-world height thresholds
+                if abs_ht_change_meters > 0.075:  # ≥7.5 cm typical stair
+                    proposed_surface = 'stair up' if net_ht_change_meters > 0 else 'stair down'
+                elif 0.02 < abs_ht_change_meters <= 0.06:  # 2–6 cm for slopes
+                    proposed_surface = 'slope up' if net_ht_change_meters > 0 else 'slope down'
+                else:
+                    proposed_surface = 'level'
+
+                # Hysteresis: allow switching only if change is strong or consistent
+                if proposed_surface == prev_surface_state:
+                    surface_state = proposed_surface
+                elif proposed_surface != 'level' and abs(net_ht_change_meters - prev_net_ht_change) > 0.01:
+                    # Only allow transitions to/from non-level if there's a jump (>1cm)
+                    surface_state = proposed_surface
+                    prev_surface_state = surface_state
+                elif prev_surface_state != 'level' and abs_ht_change_meters > 0.06:
+                    # Hold the previous non-level state slightly longer if it's still steep
+                    surface_state = prev_surface_state
+                else:
+                    # Allow fallback to level
+                    surface_state = 'level'
+                    prev_surface_state = 'level'
+
+            # Always update net_ht_change
+            prev_net_ht_change = net_ht_change_meters
+
+            # ── Debug Print ──────────────────────────────────────────────────
+            print(f"[TERRAIN-DEBUG] frame={i}, net_ht_change={net_ht_change:.5f}, "
+                  f"dz_trend={dz_trend:.5f}, dz_mean_norm={dz_mean_norm:.5f}, "
+                  f"velocity={vel_mean:.3f}, surface={surface_state}")
+
+            # ── Relative height to current floor estimate ───────────────
+            window_relative_ht = window_ht_smooth - floor_estimate #this value is now invariant to absolute floor elevation
+            
+            ht_value = window_ht_smooth[-1] #ht value at end of each sequence
+            
+            # inference
+            data_chunk = input_data[i].reshape(1, sequence_length, input_dim)
+            start_time = time.time()
+            out_loco, out_turn, out_predfog = [np.squeeze(o) for o in infer_onnx(model, data_chunk)] #run inference
+            total_inference_time += time.time() - start_time
+            
+            out_loco = ema(out_loco, alpha=0.1)
+            out_turn = ema(out_turn, alpha=0.1)
+            out_predfog = ema(out_predfog, alpha=0.1)
+            
+            loco_probs_mid = out_loco[-1] #prediction at LAST frame of seq
+            turn_probs_mid = out_turn[-1]
+            #pred_fog_prob_mid = out_predfog[-1] if out_predfog.ndim > 0 else out_predfog #-1 is end for sl=30
+
+            walk_prob_buffer.append(loco_probs_mid[1]) #where loco_probs_mid[1] is Walk Status (loco_probs_mid[1] is NonWalk)
+            turnL_prob_buffer.append(turn_probs_mid[1]) #where turn_probs_mid[1] is Turn L Status (loco_probs_mid[0] is No Turn)
+            turnR_prob_buffer.append(turn_probs_mid[2]) #where turn_probs_mid[2] is Turn R Status (loco_probs_mid[0] is No Turn)
+            for buf in [walk_prob_buffer, turnL_prob_buffer, turnR_prob_buffer]: #short term past memory to smooth/debounce
+                if len(buf) > 3: buf.pop(0)
+            
+            # postural state machine section for sit, stand, and transitions for sequence level determinations:
+            
+            # For Sit-to-Stand and Stand-to-Sit
+            ht_slope = np.mean(window_ht_smooth[-10:]) - np.mean(window_ht_smooth[:10])
+
+            #sit v stand
+            if rolling_posture_state is None:
+                avg_ht = np.mean(window_ht_smooth)
+                rolling_posture_state = 0 if avg_ht < sit_thresh else 1
+
+            new_posture = None
+            
+            #sit to stand    
+            if new_posture is None:
+                if rolling_posture_state == 0 and ht_value > (sit_thresh+0.1):
+                    if ht_slope > 0.02:
+                        new_posture = 2
+                        posture_state_buffer = [2] * local_min_duration #how long we lock in the state
+                    
+            #stand to sit
+            if new_posture is None:
+                if rolling_posture_state == 1 and ht_value < stand_thresh \
+                   and ht_value < (sit_thresh + 0.1) and ht_slope < -0.02:
+                    new_posture = 3
+                    posture_state_buffer = [3] * local_min_duration #how long we lock in the state
+            
+            # stand
+            if new_posture is None:
+                if ht_value < sit_thresh:
+                    new_posture = 0
+                elif ht_value > stand_thresh:
+                    new_posture = 1
+                else:
+                    new_posture = rolling_posture_state or 1
+
+            if new_posture == 2 and ht_value > stand_thresh:
+                new_posture = 1
+            if new_posture == 3 and ht_value < sit_thresh:
+                new_posture = 0
+
+            posture_state_buffer.append(new_posture)
+            if len(posture_state_buffer) > local_min_duration:
+                posture_state_buffer.pop(0)
+            stable_posture = Counter(posture_state_buffer).most_common(1)[0][0]
+
+            if stable_posture in (2, 3):
+                if posture_bridge_countdown == 0:
+                    posture_bridge_countdown = 3 #req min frames for state to be in place
+                    posture_bridge_label = stable_posture
+                else:
+                    posture_bridge_countdown -= 1
+                stable_posture = posture_bridge_label
+            elif posture_bridge_countdown > 0:
+                stable_posture = posture_bridge_label
+                posture_bridge_countdown -= 1
+
+            rolling_posture_state = stable_posture
+
+
+            # frame-level determination logic to ensure every frame is labeled (rather than just 1 label per seq)
+            for offset in range(sequence_length): #offset is the index WITHIN the sequence (index within an index)
+                frame_idx = base_frame_idx + offset
+                if frame_idx >= num_samples:
+                    continue
+
+                # Accumulate outputs - only relevant when stride < seq_len
+                loco_accum[frame_idx] += out_loco[offset]
+                turn_accum[frame_idx] += out_turn[offset]
+                predfog_accum[frame_idx] += out_predfog[offset] #if not np.isscalar(out_predfog) else out_predfog
+                frame_counts[frame_idx] += 1
+
+                # Determine class predictions
+                loco_class = np.argmax(out_loco[offset])
+                turn_class = np.argmax(out_turn[offset])
+                tdir = turn_class if out_turn[offset][turn_class] >= turn_conf_thresh else 0
+                pred_prob = out_predfog[offset] #if not np.isscalar(out_predfog) else out_predfog
+                print(f"predfog_prob_={pred_prob:.3f}")
+
+                # Posture-based logic
+                if stable_posture == 0:
+                    frame_motor_state = 0 #sit
+                elif stable_posture == 2:
+                    frame_motor_state = 2 #sts
+                elif stable_posture == 3:
+                    frame_motor_state = 3 #stand to sit
+                else:
+                    if tdir == 1:
+                        frame_motor_state = 4 #turn l
+                    elif tdir == 2:
+                        frame_motor_state = 5 #turn r
+                    elif loco_class == 1 and out_loco[offset][loco_class] >= loco_conf_thresh:
+                        frame_motor_state = 8 #walk
+                    else:
+                        frame_motor_state = 8 if vel_mean > standing_vel_thresh else 1 #stand
+
+                # main motor states - smoothing logic
+                motor_state_buffer.append(frame_motor_state)
+                if len(motor_state_buffer) > local_min_duration:
+                    motor_state_buffer.pop(0)
+                stable_motor_state = Counter(motor_state_buffer).most_common(1)[0][0]
+
+                #motor_votes[frame_idx].append(stable_motor_state) #comment out if stride = sl
+                motor_state_series[frame_idx] = stable_motor_state #comment out if stride < sl
+                
+                #  predFOG - smoothing logic 
+                raw_predfog_state = int(pred_prob >= pred_fog_threshold) #IF frame-level fog pred
+                #raw_predfog_state = int(pred_fog_prob_mid >= pred_fog_threshold)
+                # Append to buffer and maintain length
+                predfog_buffer.append(raw_predfog_state)
+                if len(predfog_buffer) > (int(local_min_duration*2)):
+                    predfog_buffer.pop(0)
+                # Smooth by majority voting
+                stable_predfog = int(sum(predfog_buffer) > (len(predfog_buffer) // 2))
+                
+                #predfog_votes[frame_idx].append(stable_predfog) #comment out if stride = sl
+                pred_fog_series[frame_idx] = stable_predfog #comment out if stride < sl
+
+                # Surface label
+                surface_state_series[frame_idx] = surface_state
+
+                # ── Timestamps and labels ──────────────────────────────────────────
+                t_sec = frame_idx / sample_rate_hz
+                state_name = class_index_to_label_main.get(stable_motor_state, "Unknown")
+
+                # ── Heights at midpoint of window ───────────────────────────
+                ht_norm       = window_ht_smooth[mid_idx]                    # Normalized height
+                ht_rel        = window_relative_ht[mid_idx]                  # Floor-relative
+                ht_meters     = ht_norm * user_standing_ht                  # Actual height in meters
+                floor_meters  = floor_estimate * user_standing_ht           # Floor estimate in meters
+
+                # ── Print RT and Terrain Debug ─────────────────────────────
+                print(f"[EDGE-RT] t={t_sec:.2f}s frame={frame_idx} → {state_name} | predFOG={pred_fog_series[frame_idx]}")
+                print(f"[HEIGHT] meters={ht_meters:.3f} | norm_ht={ht_norm:.3f} | rel_ht={ht_rel:.3f}")
+                print(f"[FLOOR]  norm_est={floor_estimate:.3f} | meters={floor_meters:.3f}")
+                print(f"[TERRAIN] dz_mean={dz_mean_meters:.5f} | dz_var={dz_var_meters:.6f} | surface={surface_state}")
+                
+                pbar.update(1)
+                
+            min_step_interval_seconds = 0.7
+            min_step_interval_frames = int(min_step_interval_seconds * sample_rate_hz)
+                
+            # Only proceed if the height window is complete
+            if i + sequence_length <= len(raw_ht):
+                window_ht_rel = raw_ht[i : i + sequence_length]
+                if len(window_ht_rel) < sequence_length:
+                    pass  # skip short edge cases
+                else:
+                    # Use midpoint motor state as gait phase reference
+                    mid_idx = sequence_length // 2
+                    mid_motor_state = motor_state_series[i + mid_idx]
+
+                    print(f"[DEBUG] mid_motor_state = {mid_motor_state} at frame {i}")
+
+                    if mid_motor_state == 8:  # 8 = Walking
+                        midstance_indices, _ = find_peaks(
+                            -window_ht_rel,
+                            distance=10,            # min local peak spacing
+                            prominence=0.005
+                        )
+                        
+                        print(f"[DEBUG] Peaks found: {midstance_indices}")
+
+                        for local_idx in midstance_indices:
+                            global_idx = i + local_idx
+                            print(f"[DEBUG] Candidate step @ frame={global_idx}, Δ={global_idx - last_step_idx}")
+
+                            if global_idx - last_step_idx >= min_step_interval_frames:
+                                detected_steps.append(global_idx)
+                                if global_idx < num_samples: 
+                                    step_event_series[global_idx] = 1
+                                last_step_idx = global_idx
+                                print(f"[STEP EVENT] Detected step at frame {global_idx} | height = {window_ht_rel[local_idx]:.4f}")
+
+            if len(detected_steps) >= 5:
+                step_times = np.diff(detected_steps[-2:]) / sample_rate_hz
+                if np.any(step_times):  # avoid divide by zero
+                    avg_step_time = np.mean(step_times)
+                    cadence = 60 / avg_step_time
+                    print(f"[GAIT LIVE] Cadence ≈ {cadence:.1f} steps/min (last 5 steps)")
+
+            posture_state_series.append([stable_posture] * sequence_length)
+
+            elapsed = time.time() - window_start_time
+            total_loop_time += elapsed
+
+            # Simulate real-time timing if needed (comment out if not being used)
+#             expected_window_time = stride / sample_rate_hz
+#             if elapsed < expected_window_time:
+#                 time.sleep(expected_window_time - elapsed)
+
+            i += stride
+         
+    # ── Finalize frame-wise predictions using vote buffers **NOT NEEDED IF STRIDE == SEQ_LEN ──────────────
+#     for frame_idx in range(num_samples):
+#         # Motor state: majority vote
+#         if motor_votes[frame_idx]:
+#             motor_state_series[frame_idx] = Counter(motor_votes[frame_idx]).most_common(1)[0][0]
+
+#         # predFOG state: majority vote
+#         if predfog_votes[frame_idx]:
+#             pred_fog_series[frame_idx] = int(np.mean(predfog_votes[frame_idx]) >= 0.5)
+
+    frame_counts_safe = np.where(frame_counts == 0, 1, frame_counts)
+    final_loco_probs = loco_accum / frame_counts_safe[:, None]
+    final_turn_probs = turn_accum / frame_counts_safe[:, None]
+    final_predfog_probs = predfog_accum / frame_counts_safe
+
+    posture_state_series_flat = np.array(posture_state_series).flatten()
+    
+    print(f"\n[EDGE-RT] Total runtime for full loop: {total_loop_time:.2f} seconds")
+    print(f"[EDGE-RT] Avg loop time per sequence: {total_loop_time / num_sequences:.4f} seconds")
+    print(f"\n[EDGE-RT] Average inference time per sequence: {total_inference_time / num_sequences:.4f} seconds")
+
+    return (
+        motor_state_series,
+        pred_fog_series,
+        final_loco_probs,
+        final_turn_probs,
+        final_predfog_probs,
+        posture_state_series_flat,
+        num_samples,
+        ht_smoothed[:num_samples],
+        smooth_velocity[:num_samples],
+        ang_vel_sm_l[:num_samples],
+        ang_vel_sm_r[:num_samples],
+        surface_state_series, #surface_state_log,
+        step_event_series
+    )
+
+                     
+def normalize_height_velocity(raw_height, raw_velocity, seated_height, standing_height, walk_velocity_ref):
+    """
+    Match training normalization:
+    - Normalize height so that seated = 0.0 and standing = 1.0.
+    - Normalize velocity so that walking speed ~1.0 based on user-specific walk_velocity_ref.
+    """
+    
+    # ✅ Height normalization: seated → 0.0, standing → 1.0
+    denom_ht = standing_height - seated_height
+    norm_height = (raw_height - seated_height) / (denom_ht + 1e-6)  # prevent div-by-zero
+    norm_height = np.clip(norm_height, 0.0, 1.0)
+
+    # ✅ Velocity normalization: walking → 1.0
+    norm_velocity = raw_velocity / (walk_velocity_ref + 1e-6)  # avoid div-by-zero
+    
+    return norm_height, norm_velocity
+
+
+# def normalize_height_velocity(raw_height, raw_velocity, seated_height, standing_height, walk_velocity_ref):
+#     """
+#     Match training normalization:
+#     - Normalize height so that seated = 0.0 and standing = 1.0.
+#     - Normalize velocity so that walking speed ~1.0 based on user-specific walk_velocity_ref.
+#     """
+    
+#     # ✅ Height normalization: seated → 0.0, standing → 1.0
+#     denom_ht = standing_height - seated_height
+#     norm_height = (raw_height - seated_height) / (denom_ht + 1e-6)  # prevent div-by-zero
+#     norm_height = np.clip(norm_height, 0.0, 1.0)
+    
+#     walk_velocity_ref = max(walk_velocity_ref, 1e-6) # avoid div-by-zero
+
+#     # ✅ Velocity normalization: walking → 1.0
+#     norm_velocity = raw_velocity / walk_velocity_ref
+    
+#     return norm_height, norm_velocity
+
+
+    
+def preprocess_data(file_path, sequence_length, user_seated_ht, user_standing_ht, user_walk_vel_ref):
+    """
+    Preprocesses data for inference
+    
+    Parameters:
+    - file_path: str, path to the .hdf5 file containing input data
+    - sequence_length: int, length of each sequence for model input
+    
+    Returns:
+    - reshaped_data: np.array, data reshaped into sequences ready for model inference
+    """
+    
+    with h5py.File(file_path, 'r') as f:
+        velocity_XZ = f['VelocityXZ_unfiltered'][:]
+        cam_ang = f['camCorrected'][:, 4]
+
+        height_above_ground = np.copy(f['camCorrected_unfiltered'][:, 1])
+        if 'floory_Global' in f:
+            floor_y = np.squeeze(np.copy(f['floory_Global'][:]))
+            if floor_y.size == 1:
+                floor_y = np.full_like(height_above_ground, floor_y.item())  
+            elif floor_y.shape != height_above_ground.shape:
+                floor_y = np.resize(floor_y, height_above_ground.shape)  
+        else:
+            floor_y = np.full_like(height_above_ground, -1.6)  # Fallback value for test cases
+
+        height_above_ground -= floor_y
+
+        ht_norm, vel_norm = normalize_height_velocity(height_above_ground, velocity_XZ, user_seated_ht, user_standing_ht, user_walk_vel_ref)
+                
+        input_data = np.column_stack([vel_norm, ht_norm, cam_ang])
+
+        stride = sequence_length # modify IF stride is shorter than seq len (overlap) i.e. // 2
+        
+        num_sequences = (len(input_data) - sequence_length) // stride + 1
+        
+        reshaped_data = np.array([
+            input_data[i * stride : i * stride + sequence_length]
+            for i in range(num_sequences)
+        ])
+        print(f"Total Sequences Created: {num_sequences}, Shape of Reshaped Data: {reshaped_data.shape} (expecting [N, 30, 3])")
+    
+        # Apply feature engineering to sequence-shaped input (shape: [N, 30, 4])
+        input_data, smooth_velocity, ht_smoothed, ang_vel_sm_l, ang_vel_sm_r = feature_engineering(reshaped_data)
+
+        # Convert to float32 for ONNX
+        input_data = input_data.astype(np.float32)
+
+        # Confirm shape matches expectation - i.e. 4 engineered features for input to model
+        print(f"input_data after feature engineering shape : {input_data.shape} (expecting [N, 30, 4])")
+
+        # Slice flattened sequences to get original-frame-aligned output
+        expected_len = (num_sequences - 1) * stride + sequence_length
+        print(f"[DEBUG] Trimming to original length: {expected_len}")
+        
+        print(f"smooth_velocity before mod in return step shape : {smooth_velocity.shape}")
+        print(f"ht_smoothed before mod in return step shape : {ht_smoothed.shape}")
+        
+        return (
+            input_data,
+            smooth_velocity.reshape(-1)[:expected_len],
+            ht_smoothed.reshape(-1)[:expected_len],
+            ang_vel_sm_l.reshape(-1)[:expected_len],
+            ang_vel_sm_r.reshape(-1)[:expected_len],
+            height_above_ground[:expected_len]
+        )
+
+def generate_ground_truth_labels(file_path, shift_value=0, gap_fill=True):
+    """
+    Loads raw ground truth binary channels and combines them into a single main label,
+    using robust priority order and optional forward-fill for gaps.
+    Only returns: ground_truth_main, ground_truth_predfog_shifted
+    """
+    required_keys = [
+        'Sittings', 'Standings', 'SitToStands', 'StandToSits',
+        'Turning1L', 'Turning1R', 'Turning2L', 'Turning2R',
+        'Walkings', 'FOGs', 'predictionFOG'
+    ]
+
+    with h5py.File(file_path, 'r') as hdf5_file:
+        missing_keys = [key for key in required_keys if key not in hdf5_file]
+        if missing_keys:
+            raise ValueError(f"Missing ground truth datasets: {', '.join(missing_keys)}")
+
+        # Load raw GT channels
+        sittings = hdf5_file['Sittings'][:].flatten()
+        standings = hdf5_file['Standings'][:].flatten()
+        sit_to_stands = hdf5_file['SitToStands'][:].flatten()
+        stand_to_sits = hdf5_file['StandToSits'][:].flatten()
+        turning1l = hdf5_file['Turning1L'][:].flatten()
+        turning1r = hdf5_file['Turning1R'][:].flatten()
+        turning2l = hdf5_file['Turning2L'][:].flatten()
+        turning2r = hdf5_file['Turning2R'][:].flatten()
+        walkings = hdf5_file['Walkings'][:].flatten()
+        predFOGs = hdf5_file['predictionFOG'][:].flatten()
+        # fogs = hdf5_file['FOGs'][:].flatten()  # loaded but not returned
+
+        num_samples = len(sittings)
+
+        # Priority: transitions > turns > walking > standing > sitting
+        ground_truth_main = -1 * np.ones(num_samples, dtype=int)
+        ground_truth_main[sit_to_stands == 1] = 2
+        ground_truth_main[stand_to_sits == 1] = 3
+        ground_truth_main[turning1l == 1] = 4
+        ground_truth_main[turning1r == 1] = 5
+        ground_truth_main[turning2l == 1] = 6
+        ground_truth_main[turning2r == 1] = 7
+        ground_truth_main[walkings == 1] = 8
+        ground_truth_main[standings == 1] = 1
+        ground_truth_main[sittings == 1] = 0
+        
+        # ✅ Combine TW_L + TIP_L → Turn_Left (4)
+        ground_truth_main[np.isin(ground_truth_main, [6])] = 4
+
+        # ✅ Combine TW_R + TIP_R → Turn_Right (5)
+        ground_truth_main[np.isin(ground_truth_main, [7])] = 5
+
+        if gap_fill:
+            # ✅ Forward-fill all remaining -1s with last known label
+            for i in range(1, num_samples):
+                if ground_truth_main[i] == -1:
+                    ground_truth_main[i] = ground_truth_main[i - 1]
+            if ground_truth_main[0] == -1:
+                valid_idx = np.where(ground_truth_main != -1)[0]
+                if len(valid_idx) > 0:
+                    ground_truth_main[:valid_idx[0]] = ground_truth_main[valid_idx[0]]
+                else:
+                    ground_truth_main[:] = 0
+        else:
+            # Fallback to Standing for leftover -1s
+            ground_truth_main[ground_truth_main == -1] = 1
+
+        print(f"✅ GT main unique labels: {np.unique(ground_truth_main)}")
+        print(f"✅ GT main shape: {ground_truth_main.shape}")
+
+        # predFOG shift
+        if shift_value >= num_samples:
+            print(f"Shift value {shift_value} exceeds data length — predFOG zeros.")
+            ground_truth_predfog_shifted = np.zeros_like(predFOGs)
+        else:
+            ground_truth_predfog_shifted = np.roll(predFOGs, -shift_value)
+            print(f"✅ predFOG shifted: {np.sum(ground_truth_predfog_shifted)} nonzero")
+
+        return ground_truth_main, ground_truth_predfog_shifted
+
+
+def compare_with_leniency(gt, pred, tolerance=15):
+    """
+    Compare predictions to ground truth with leniency, allowing a match within a specified tolerance window.
+
+    Parameters:
+    - gt: array-like, ground truth labels
+    - pred: array-like, predicted labels
+    - tolerance: int, number of frames before and after to consider as a lenient match
+
+    Returns:
+    - matches: int, number of lenient matches found
+    """
+    # Ensure ground truth and predictions are of the same length
+    if len(gt) != len(pred):
+        print("Warning: Ground truth and predictions have different lengths. Truncating to match.")
+        min_length = min(len(gt), len(pred))
+        gt, pred = gt[:min_length], pred[:min_length]
+
+    matches = sum(
+        any(gt[max(0, i - tolerance):min(len(gt), i + tolerance + 1)] == pred[i])
+        for i in range(len(pred))
+    )
+    return matches
+
+def log_memory_usage(stage, return_usage=False):
+    process = psutil.Process()
+    memory_info = process.memory_info()
+    memory_usage = memory_info.rss / (1024 * 1024)  # Convert to MB
+    print(f"[{stage} - Memory Usage]: {memory_usage:.2f} MB")
+    if return_usage:
+        return memory_usage
+
+# Load all ONNX models from a folder
+def load_all_models(folder_path):
+    models = []
+    for filename in os.listdir(folder_path):
+        if filename.endswith('.onnx'):
+            model_path = os.path.join(folder_path, filename)
+            try:
+                print(f"Loading model from: {model_path}")
+                model = ort.InferenceSession(model_path)
+                models.append((filename, model))  # Store model name with model
+            except Exception as e:
+                print(f"Error loading model {filename}: {e}")
+    print(f"Total models loaded: {len(models)}")
+    return models
+
+# Function to plot predicted vs. ground truth motor states
+def plot_motor_states_overlay(ground_truth, predicted, model_name, class_index_to_label_main):
+    """
+    Plot predicted vs. ground truth motor state labels.
+    Safely trims to match shortest length.
+    """
+    gt_len = len(ground_truth)
+    pred_len = len(predicted)
+    min_len = min(gt_len, pred_len)
+
+    if gt_len != pred_len:
+        print(f"[Motor States Plot] Length mismatch: GT={gt_len}, Pred={pred_len} → using min_len={min_len}")
+
+    ground_truth = np.array(ground_truth[:min_len])
+    predicted = np.array(predicted[:min_len])
+
+    time = np.arange(min_len)
+
+    plt.figure(figsize=(14, 6))
+    plt.plot(time, ground_truth, label='Ground Truth', alpha=0.7, color='blue')
+    plt.plot(time, predicted, label='Predicted', alpha=0.7, color='orange')
+
+    plt.title(f'Predicted vs Ground Truth Motor States - {model_name}')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Motor State')
+    sorted_keys = sorted(class_index_to_label_main.keys())
+    plt.yticks(
+        ticks=sorted_keys,
+        labels=[class_index_to_label_main[i] for i in sorted_keys]
+    )
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def plot_fog_states_overlay(gt_fog, pred_prefog, model_name, vel):
+    """
+    Plot ground truth FOG vs predicted predFOG.
+    Safely trims to match shortest length.
+    """
+    gt_len = len(gt_fog)
+    pred_len = len(pred_prefog)
+    vel_len = len(vel)
+    min_len = min(gt_len, pred_len, vel_len)
+
+    if len(set([gt_len, pred_len, vel_len])) != 1:
+        print(f"[FOG States Plot] Length mismatch: GT={gt_len}, Pred={pred_len}, Vel={vel_len} → using min_len={min_len}")
+
+    gt_fog = np.array(gt_fog[:min_len])
+    pred_prefog = np.array(pred_prefog[:min_len])
+    vel = np.array(vel[:min_len])
+
+    time = np.arange(min_len)
+
+    plt.figure(figsize=(14, 4))
+    plt.plot(time, gt_fog, label='Ground Truth FOG', color='blue', alpha=0.7)
+    plt.plot(time, pred_prefog, label='Predicted predFOG', color='green', linestyle=':', alpha=0.7)
+    plt.plot(time, vel, label='vel', color='red', linestyle=':', alpha=0.7)
+
+    plt.title(f'Ground Truth vs Predicted predFOG - {model_name}')
+    plt.xlabel('Time Steps')
+    plt.ylabel('FOG State')
+    plt.yticks([0, 1], ["Non-PredFOG", "PredFOG"])
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+
+def evaluate_with_temporal_leniency(predicted, ground_truth, tolerance):
+    if len(predicted) != len(ground_truth):
+        print("Warning: Length mismatch between predicted and ground truth labels. Adjusting to shortest length.")
+        min_length = min(len(predicted), len(ground_truth))
+        predicted, ground_truth = predicted[:min_length], ground_truth[:min_length]
+    
+    correct_predictions = sum(
+        any(predicted[i] == ground_truth[j] for j in range(max(0, i - tolerance), min(len(ground_truth), i + tolerance + 1)))
+        for i in range(len(predicted))
+    )
+    accuracy_with_leniency = correct_predictions / len(predicted)
+    return accuracy_with_leniency
+
+def evaluate_with_temporal_leniency_metrics(predicted, ground_truth, tolerance):
+    if len(predicted) != len(ground_truth):
+        print("Warning: Length mismatch between predicted and ground truth labels. Adjusting to shortest length.")
+        min_length = min(len(predicted), len(ground_truth))
+        predicted, ground_truth = predicted[:min_length], ground_truth[:min_length]
+
+    true_positives = 0
+    false_positives = 0
+    false_negatives = 0
+
+    for i in range(len(predicted)):
+        start_index = max(0, i - tolerance)
+        end_index = min(len(predicted), i + tolerance + 1)
+        
+        if any(predicted[i] == ground_truth[j] for j in range(start_index, end_index)):
+            true_positives += 1
+        else:
+            if predicted[i] == 1:  # Positive prediction
+                false_positives += 1
+            if ground_truth[i] == 1:  # True positive in ground truth
+                false_negatives += 1
+
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+    f1 = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0
+    
+    return precision, recall, f1
+
+def fuzzy_binary_metrics(pred, gt, tol):
+    pred = np.asarray(pred).astype(bool)
+    gt   = np.asarray(gt).astype(bool)
+
+    # Dilate ground truth
+    from scipy.ndimage import maximum_filter1d
+    gt_dilated = maximum_filter1d(gt, size=2*tol+1)
+
+    tp = np.sum(pred & gt_dilated)
+    fp = np.sum(pred & ~gt_dilated)
+    fn = np.sum(gt & ~pred)
+
+    precision = tp / (tp + fp + 1e-9)
+    recall    = tp / (tp + fn + 1e-9)
+    f1        = 2*precision*recall/(precision+recall+1e-9)
+    acc       = np.mean((pred == 0) & (gt == 0) | (pred & gt_dilated))
+    return acc, precision, recall, f1
+
+
+def get_file_length(file_path, dataset_name):
+    try:
+        with h5py.File(file_path, 'r') as hdf5_file:
+            if dataset_name in hdf5_file:
+                return len(hdf5_file[dataset_name])
+            else:
+                print(f"Dataset '{dataset_name}' not found in the HDF5 file.")
+                return 0
+    except Exception as e:
+        print(f"Error accessing file: {e}")
+        return 0
+
+def plot_confusion_matrix(y_true, y_pred, class_names, model_name):
+    labels = list(range(len(class_names)))  # Ensure expected label count
+    cm = confusion_matrix(y_true, y_pred, labels=labels)  # Force both 0 and 1
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
+    disp.plot(cmap=plt.cm.Blues)
+    plt.title(f'Confusion Matrix - {model_name}')
+    plt.show()
+
+def adjust_length_to_match(ground_truth, predictions):
+    min_len = min(len(ground_truth), len(predictions))
+    if len(ground_truth) != len(predictions):
+        print("Warning: Adjusting length to match between ground truth and predictions.")
+    return ground_truth[:min_len], predictions[:min_len]
+
+
+def majority_min_duration_filter(predictions, target_class, min_duration, window=5):
+    """
+    Applies a majority-vote based correction to short-lived segments of a target class.
+    
+    Parameters:
+    - predictions: np.array, sequence of class predictions
+    - target_class: int, class to enforce minimum duration for
+    - min_duration: int, minimum frames required to retain the target class
+    - window: int, number of neighbors to consider for majority vote
+
+    Returns:
+    - corrected_predictions: np.array, refined predictions
+    """
+    predictions = np.array(predictions)
+    corrected = predictions.copy()
+    n = len(predictions)
+    i = 0
+
+    while i < n:
+        if corrected[i] == target_class:
+            # Found a start of a sequence
+            start = i
+            while i < n and corrected[i] == target_class:
+                i += 1
+            end = i
+
+            segment_length = end - start
+
+            if segment_length < min_duration:
+                # If too short, replace the segment
+                # Look at neighbors
+                left_window = corrected[max(0, start - window):start]
+                right_window = corrected[end:min(n, end + window)]
+                neighbors = np.concatenate([left_window, right_window])
+
+                if len(neighbors) > 0:
+                    # Majority voting
+                    counts = np.bincount(neighbors)
+                    majority_label = np.argmax(counts)
+                else:
+                    # fallback if no neighbors
+                    majority_label = corrected[start-1] if start > 0 else corrected[end] if end < n else target_class
+
+                corrected[start:end] = majority_label
+
+        else:
+            i += 1
+
+    return corrected
+
+
+def apply_min_duration_threshold(predictions, target_class, min_duration):
+    """
+    Ensures that the target_class only appears in the predictions if it meets a minimum duration threshold.
+    
+    Parameters:
+    - predictions: array-like, the predicted classes.
+    - target_class: int, the class for which the minimum duration should be enforced.
+    - min_duration: int, the minimum number of consecutive frames required for the target_class.
+    
+    Returns:
+    - Modified predictions with enforced minimum duration for the target_class.
+    """
+    predictions = np.array(predictions)
+    result = predictions.copy()
+    start_idx = 0
+
+    while start_idx < len(predictions):
+        # Find the start of a sequence of the target class
+        if predictions[start_idx] == target_class:
+            end_idx = start_idx
+            # Count the length of this contiguous sequence
+            while end_idx < len(predictions) and predictions[end_idx] == target_class:
+                end_idx += 1
+            
+            # Check if this sequence meets the minimum duration requirement
+            sequence_length = end_idx - start_idx
+            if sequence_length < min_duration:
+                # If the sequence is too short, replace it with the preceding state
+                # If there’s no preceding state (i.e., start_idx is 0), use the next state after the sequence
+                replace_class = predictions[start_idx - 1] if start_idx > 0 else predictions[end_idx] if end_idx < len(predictions) else -1
+                result[start_idx:end_idx] = replace_class
+            
+            # Move the start index to the end of this sequence
+            start_idx = end_idx
+        else:
+            # Move to the next index if the target class is not found
+            start_idx += 1
+    
+    return result
+
+def fuzzy_classwise_metrics(pred, gt, tolerance, classes_to_eval):
+    """
+    Compute fuzzy match metrics per class with a temporal tolerance.
+    Only evaluates the explicitly provided classes.
+    """
+    results = []
+    pred = np.asarray(pred)
+    gt = np.asarray(gt)
+
+    total_support = 0
+    sum_precision = 0.0
+    sum_recall = 0.0
+    sum_f1 = 0.0
+    sum_accuracy = 0.0
+
+    weighted_precision = 0.0
+    weighted_recall = 0.0
+    weighted_f1 = 0.0
+    weighted_accuracy = 0.0
+
+    for cls in classes_to_eval:
+        pred_mask = (pred == cls).astype(int)
+        gt_mask = (gt == cls).astype(int)
+
+        pred_indices = np.where(pred_mask == 1)[0]
+        gt_indices = np.where(gt_mask == 1)[0]
+
+        matched_pred = np.zeros_like(pred_mask)
+        matched_gt = np.zeros_like(gt_mask)
+
+        for gi in gt_indices:
+            start = max(0, gi - tolerance)
+            end = min(len(pred), gi + tolerance + 1)
+            possible_matches = pred_mask[start:end] * (1 - matched_pred[start:end])
+            if np.any(possible_matches):
+                match_idx = np.where(possible_matches)[0][0] + start
+                matched_gt[gi] = 1
+                matched_pred[match_idx] = 1
+
+        tp = np.sum(matched_gt)
+        fp = np.sum(pred_mask) - tp
+        fn = np.sum(gt_mask) - tp
+        tn = len(pred) - (tp + fp + fn)
+
+        precision = tp / (tp + fp + 1e-9)
+        recall = tp / (tp + fn + 1e-9)
+        f1 = 2 * precision * recall / (precision + recall + 1e-9)
+        accuracy = (tp + tn) / len(pred)
+
+        support = np.sum(gt_mask)
+        total_support += support
+
+        sum_precision += precision
+        sum_recall += recall
+        sum_f1 += f1
+        sum_accuracy += accuracy
+
+        weighted_precision += precision * support
+        weighted_recall += recall * support
+        weighted_f1 += f1 * support
+        weighted_accuracy += accuracy * support
+
+        results.append({
+            'class': cls,
+            'accuracy': round(accuracy, 2),
+            'precision': round(precision, 2),
+            'recall': round(recall, 2),
+            'f1': round(f1, 2),
+            'tp': int(tp),
+            'fp': int(fp),
+            'fn': int(fn),
+            'support': int(support)
+        })
+
+    # Macro averages
+    macro_avg = {
+        'class': 'macro_avg',
+        'accuracy': round(sum_accuracy / len(classes_to_eval), 2),
+        'precision': round(sum_precision / len(classes_to_eval), 2),
+        'recall': round(sum_recall / len(classes_to_eval), 2),
+        'f1': round(sum_f1 / len(classes_to_eval), 2),
+        'tp': None,
+        'fp': None,
+        'fn': None,
+        'support': total_support
+    }
+    results.append(macro_avg)
+
+    # Weighted averages
+    if total_support > 0:
+        weighted_avg = {
+            'class': 'weighted_avg',
+            'accuracy': round(weighted_accuracy / total_support, 2),
+            'precision': round(weighted_precision / total_support, 2),
+            'recall': round(weighted_recall / total_support, 2),
+            'f1': round(weighted_f1 / total_support, 2),
+            'tp': None,
+            'fp': None,
+            'fn': None,
+            'support': total_support
+        }
+        results.append(weighted_avg)
+
+    return results
+
+
+
+# -------------------------------
+#  Post-processing parameters:
+# -------------------------------
+
+STATE_LABELS = [
+    "Sitting", "Standing", "SitToStand", "StandToSit", 
+    "Turning1L", "Turning1R", "Turning2L", "Turning2R", "Walking"
+]
+
+TRANSITION_MATRIX = np.array([
+    [0.85, 0.10, 0.04, 0.00, 0.005, 0.005, 0.00, 0.00, 0.00],  # Sitting
+    [0.01, 0.85, 0.03, 0.03, 0.02, 0.02, 0.01, 0.01, 0.02],      # Standing
+    [0.00, 0.25, 0.60, 0.05, 0.02, 0.02, 0.01, 0.01, 0.04],      # SitToStand
+    [0.20, 0.10, 0.05, 0.60, 0.02, 0.02, 0.00, 0.00, 0.01],      # StandToSit
+    [0.01, 0.10, 0.01, 0.01, 0.75, 0.05, 0.03, 0.03, 0.01],      # Turn1L
+    [0.01, 0.10, 0.01, 0.01, 0.05, 0.75, 0.03, 0.03, 0.01],      # Turn1R
+    [0.00, 0.05, 0.00, 0.00, 0.05, 0.05, 0.75, 0.05, 0.05],      # Turn2L
+    [0.00, 0.05, 0.00, 0.00, 0.05, 0.05, 0.05, 0.75, 0.05],      # Turn2R
+    [0.00, 0.05, 0.00, 0.00, 0.01, 0.01, 0.05, 0.05, 0.83]       # Walking
+])
+
+
+# Minimum duration (frames) each class must appear for it to be valid
+MIN_DURATION = {
+    0: 20,  # Sitting
+    1: 20,  # Standing
+    2: 15,  # Standing
+    3: 15,  # Standing
+    4: 15,  # Turn_L
+    5: 15,  # Turn_R
+    6: 15,  # TurnWalk_L
+    7: 15,  # TurnWalk_R
+    8: 20   # Walking
+}
+
+# Binary decision threshold for FOG detection output
+FOG_THRESHOLD = 0.5
+
+def enforce_min_duration_binary(preds, min_duration_dict):
+    """
+    Enforces minimum duration per class ID on a sequence of predicted labels.
+
+    Args:
+        preds (np.ndarray): 1D array of predicted labels (e.g. [0,0,1,1,0,...])
+        min_duration_dict (dict): e.g. {0: 20, 1: 15}
+
+    Returns:
+        np.ndarray: filtered predictions with short segments replaced
+    """
+    preds = preds.copy()
+    i = 0
+    while i < len(preds):
+        cls = preds[i]
+        j = i
+        while j < len(preds) and preds[j] == cls:
+            j += 1
+        segment_len = j - i
+        if cls in min_duration_dict and segment_len < min_duration_dict[cls]:
+            # Replace with previous class or next class
+            repl = preds[i - 1] if i > 0 else (preds[j] if j < len(preds) else cls)
+            preds[i:j] = repl
+        i = j
+    return preds
+
+def viterbi_decode(emission_log_probs, transition_log_probs):
+    T, N = emission_log_probs.shape
+    path = np.zeros((T, N), int)
+    dp = emission_log_probs[0]
+    for t in range(1, T):
+        scores = dp[:, None] + transition_log_probs
+        best_prev = np.argmax(scores, axis=0)
+        dp = scores[best_prev, range(N)] + emission_log_probs[t]
+        path[t] = best_prev
+    decoded = np.zeros(T, int)
+    decoded[-1] = np.argmax(dp)
+    for t in range(T - 2, -1, -1):
+        decoded[t] = path[t + 1, decoded[t + 1]]
+    return decoded
+
+def enforce_minimum_transition_duration(labels, min_duration):
+    """
+    Reverts transitions shorter than `min_duration` to their surrounding posture.
+
+    Args:
+        labels (np.ndarray): Array with posture labels (0, 1, 2, 3)
+        min_duration (int): Minimum number of frames a transition must last
+
+    Returns:
+        np.ndarray: Adjusted labels with short transitions removed
+    """
+    labels = labels.copy()
+    T = len(labels)
+    i = 0
+
+    while i < T:
+        current = labels[i]
+        if current in [2, 3]:  # SitToStand or StandToSit
+            start = i
+            while i < T and labels[i] == current:
+                i += 1
+            end = i
+            duration = end - start
+            if duration < min_duration:
+                # Replace with surrounding class if possible
+                replacement = labels[start - 1] if start > 0 else (labels[end] if end < T else 1)
+                labels[start:end] = replacement
+        else:
+            i += 1
+
+    return labels
+
+
+def post_process_outputs(output_dict, config_dict):
+    """
+    Post-process all outputs using Viterbi decoding + smoothing.
+    
+    Args:
+        output_dict (dict): Maps output names to raw softmax predictions (np.ndarray with shape (T, 2 or 3)).
+        config_dict (dict): Maps output names to config dicts including:
+            - 'transition_matrix': optional np.ndarray
+            - 'min_duration': optional {class_id: min_frames}
+            - 'num_classes': 2 or 3
+
+    Returns:
+        processed_dict (dict): Maps output names to final predicted label arrays (shape (T,))
+    """
+    processed = {}
+
+    for name, probs in output_dict.items():
+        if probs.shape[1] == 1:
+            # Not a softmax, likely already binary (sigmoid-like)
+            preds = (probs > 0.5).astype(int).flatten()
+            processed[name] = preds
+            continue
+
+        config = config_dict.get(name, {})
+        num_classes = probs.shape[1]
+
+        if num_classes == 2:
+            preds = post_process_binary(
+                probs,
+                transition_matrix=config.get("transition_matrix"),
+                min_duration=config.get("min_duration"),
+                threshold=config.get("threshold", 0.5)
+            )
+        elif num_classes == 3:
+            preds = post_process_multiclass(
+                probs,
+                transition_matrix=config.get("transition_matrix"),
+                min_duration=config.get("min_duration")
+            )
+        else:
+            preds = np.argmax(probs, axis=1)
+        
+        processed[name] = preds
+
+    return processed
+
+def post_process_binary(probs, transition_matrix=None, min_duration=None, threshold=0.5):
+    """
+    Post-process binary output using optional smoothing, Viterbi decoding, and duration enforcement.
+    
+    Args:
+        probs (np.ndarray): Softmax probabilities of shape (T, 2)
+        transition_matrix (np.ndarray): Optional Viterbi transition matrix
+        min_duration (dict): {class_id: min_frames} for majority filter
+        threshold (float): Threshold for positive class (if not using Viterbi)
+
+    Returns:
+        np.ndarray: Final binary predictions (0 or 1)
+    """
+    smoothed_probs = medfilt(probs, kernel_size=[5, 1])
+
+    if transition_matrix is not None:
+        log_tr = np.log(transition_matrix + 1e-9)
+        log_emit = np.log(smoothed_probs + 1e-9)
+        decoded = viterbi_decode(log_emit, log_tr)
+    else:
+        decoded = (smoothed_probs[:, 1] > threshold).astype(int)
+
+    if min_duration:
+        decoded = enforce_min_duration_binary(decoded, min_duration)
+
+    return decoded
+
+def post_process_multiclass(probs, transition_matrix=None, min_duration=None):
+    smoothed_probs = medfilt(probs, kernel_size=[5, 1])
+
+    if transition_matrix is None:
+        # Uniform-ish self-favoring matrix
+        n = probs.shape[1]
+        transition_matrix = np.eye(n) * 0.85 + (1 - np.eye(n)) * (0.15 / (n - 1))
+
+    log_tr = np.log(transition_matrix + 1e-9)
+    log_emit = np.log(smoothed_probs + 1e-9)
+    decoded = viterbi_decode(log_emit, log_tr)
+
+    if min_duration:
+        decoded = enforce_min_duration_binary(decoded, min_duration)
+
+    return decoded
+
+def soft_temporal_voting(predicted_labels, window_size=5):
+    """
+    Soft majority voting post-processing.
+    
+    Parameters:
+    - predicted_labels: array-like, predicted class labels (1D)
+    - window_size: int, size of the sliding window (must be odd)
+    
+    Returns:
+    - smoothed_labels: array-like, refined labels
+    """
+    if window_size % 2 == 0:
+        window_size += 1  # Force odd size for symmetry
+
+    half_window = window_size // 2
+    n_frames = len(predicted_labels)
+    smoothed_labels = np.copy(predicted_labels)
+
+    for i in range(n_frames):
+        # Define window bounds
+        start = max(0, i - half_window)
+        end = min(n_frames, i + half_window + 1)
+
+        window = predicted_labels[start:end]
+        counts = np.bincount(window, minlength=np.max(predicted_labels) + 1)
+        
+        # Pick class with highest count
+        smoothed_labels[i] = np.argmax(counts)
+
+    return smoothed_labels
+
+def validate_posture_transitions(labels, ht_smoothed, sit_thresh=0.20, stand_thresh=0.80, max_transition_len=120):
+    """
+    Ensures each transition crosses from one posture state to the other.
+    If not, relabel as prior state.
+    """
+    cleaned = labels.copy()
+    T = len(labels)
+    t = 0
+
+    while t < T:
+        label = labels[t]
+        if label in (2, 3):  # SitToStand or StandToSit
+            start = t
+            while t < T and labels[t] == label:
+                t += 1
+            end = t
+            duration = end - start
+
+            start_ht = ht_smoothed[start]
+            end_ht = ht_smoothed[end - 1]
+
+            if duration > max_transition_len:
+                print(f"❌ Discarding transition {label} from {start} to {end} (duration {duration}) — too long")
+                cleaned[start:end] = labels[start - 1] if start > 0 else 1
+                continue
+
+            if label == 2:  # SitToStand: expect low to high
+                valid = (start_ht < sit_thresh and end_ht > stand_thresh)
+            else:  # StandToSit: expect high to low
+                valid = (start_ht > stand_thresh and end_ht < sit_thresh)
+
+            if not valid:
+                print(f"❌ Discarding transition {label} from {start} to {end} — start_ht={start_ht:.3f}, end_ht={end_ht:.3f}")
+                cleaned[start:end] = labels[start - 1] if start > 0 else 1
+        else:
+            t += 1
+
+    return cleaned
+
+
+def temporal_majority_vote(preds, window_size=5):
+    """Applies a rolling majority vote across the prediction sequence."""
+    padded = np.pad(preds, (window_size // 2,), mode='edge')
+    return np.array([mode(padded[i:i+window_size])[0][0] for i in range(len(preds))])
+
+def enforce_min_duration_multiclass(preds, min_duration_dict):
+    """
+    Removes short bursts of any class not satisfying min_duration.
+    Replaces them with the preceding label.
+    """
+    preds = preds.copy()
+    T = len(preds)
+    i = 0
+    while i < T:
+        current = preds[i]
+        start = i
+        while i < T and preds[i] == current:
+            i += 1
+        end = i
+        duration = end - start
+        if current in min_duration_dict and duration < min_duration_dict[current]:
+            fill_value = preds[start - 1] if start > 0 else preds[end]
+            preds[start:end] = fill_value
+    return preds
+
+
+def apply_softmax_confidence_filter(probs, preds, min_conf=0.6):
+    """
+    Masks low-confidence predictions based on max softmax value.
+    Carries forward previous prediction to fill gaps.
+    """
+    preds = preds.copy()
+    conf = np.max(probs, axis=1)
+    for i in range(len(preds)):
+        if conf[i] < min_conf:
+            preds[i] = preds[i - 1] if i > 0 else np.argmax(probs[i])
+    return preds
+
+
+def post_process_predictions(
+    probs,
+    min_duration_dict,
+    confidence_threshold=0.6,
+    majority_vote_window=5,
+    apply_majority_vote=True,
+    apply_confidence_filter=True,
+    debug=False
+):
+    """
+    Combines softmax-based predictions with smoothing and duration enforcement.
+
+    Args:
+        probs (np.ndarray): Softmax probabilities (T x C)
+        min_duration_dict (dict): Class index -> min duration (frames)
+        confidence_threshold (float): Min softmax max prob for accepting prediction
+        majority_vote_window (int): Rolling window size for majority vote
+        apply_majority_vote (bool): Whether to smooth predictions
+        apply_confidence_filter (bool): Whether to suppress low-confidence predictions
+        debug (bool): Print class distributions
+
+    Returns:
+        np.ndarray: Final post-processed predictions (T,)
+    """
+    raw_preds = np.argmax(probs, axis=1)
+
+    if apply_confidence_filter:
+        raw_preds = apply_softmax_confidence_filter(probs, raw_preds, min_conf=confidence_threshold)
+
+    if apply_majority_vote:
+        raw_preds = temporal_majority_vote(raw_preds, window_size=majority_vote_window)
+
+    final_preds = enforce_min_duration_multiclass(raw_preds, min_duration_dict)
+
+    if debug:
+        unique, counts = np.unique(final_preds, return_counts=True)
+        print("\n[🔍 Post-Processing Summary]")
+        for u, c in zip(unique, counts):
+            print(f"  Class {u}: {c} frames")
+
+    return final_preds
+
+
+
+def pad_transition_starts(labels, target_class, pad_frames=5):
+    """
+    Shift the start of each transition class backwards by `pad_frames`,
+    as long as we don’t cross a previous transition or leave bounds.
+    """
+    mask = (labels == target_class).astype(int)
+    starts = np.where(np.diff(mask) == 1)[0] + 1
+    if mask[0] == 1:
+        starts = np.insert(starts, 0, 0)
+
+    for s in starts:
+        pad_start = max(0, s - pad_frames)
+        pre_class = 0 if target_class == 2 else 1  # SitToStand → Sitting, StandToSit → Standing
+        for i in range(pad_start, s):
+            if labels[i] == pre_class:
+                labels[i] = target_class
+            else:
+                break  # don't overwrite prior transition or different class
+
+    return labels
+
+
+def pad_transition_ends(labels, target_class, pad_frames=5):
+    """
+    Extend the end of each transition class forward by `pad_frames`,
+    as long as we don’t cross into another transition or invalid label.
+    """
+    T = len(labels)
+    mask = (labels == target_class).astype(int)
+    ends = np.where(np.diff(mask) == -1)[0] + 1
+    if mask[-1] == 1:
+        ends = np.append(ends, T)
+
+    for e in ends:
+        pad_end = min(T, e + pad_frames)
+        post_class = 1 if target_class == 2 else 0  # SitToStand → Standing, StandToSit → Sitting
+        for i in range(e, pad_end):
+            if labels[i] == post_class:
+                labels[i] = target_class
+            else:
+                break  # don't overwrite a different transition or unexpected label
+
+    return labels
+
+def generate_posture_core(
+    ht_smoothed,
+    vel_smoothed=None,  # Kept for compatibility, unused
+    sit_thresh=0.21,
+    stand_thresh=0.70,
+    min_transition_length=5
+):
+    """
+    Generate deterministic posture labels using prior-state driven logic.
+
+    Labels:
+        0: Sitting
+        1: Standing
+        2: SitToStand
+        3: StandToSit
+    """
+    T = len(ht_smoothed)
+    labels = np.full(T, -1, dtype=int)
+    prior_state = None
+
+    for t in range(T):
+        ht = ht_smoothed[t]
+
+        if ht < sit_thresh:
+            labels[t] = 0
+            prior_state = 0
+        elif ht > stand_thresh:
+            labels[t] = 1
+            prior_state = 1
+        else:
+            # In-between: determine based on prior posture state
+            if prior_state == 0:
+                labels[t] = 2  # SitToStand
+            elif prior_state == 1:
+                if ht < (stand_thresh - 0.2):  # only deep enough dips count
+                    labels[t] = 3  # StandToSit
+                else:
+                    labels[t] = 1  # Still Standing
+            else:
+                labels[t] = 2  # default to SitToStand
+                # Do not update prior_state here
+
+    # ───────────────────────────────────────────────────────────
+    # Post-hoc cleanup: enforce min_transition_length for labels 2 and 3
+    # ───────────────────────────────────────────────────────────
+    def clean_transitions(label_array, target_class, fallback_class):
+        mask = (label_array == target_class).astype(int)
+        starts = np.where(np.diff(mask) == 1)[0] + 1
+        ends = np.where(np.diff(mask) == -1)[0] + 1
+
+        if mask[0] == 1:
+            starts = np.insert(starts, 0, 0)
+        if mask[-1] == 1:
+            ends = np.append(ends, T)
+
+        for s, e in zip(starts, ends):
+            if (e - s) < min_transition_length:
+                label_array[s:e] = fallback_class
+                print(f"🧹 Reverting {target_class} → {fallback_class} from {s} to {e} (too short)")
+
+    clean_transitions(labels, 2, 0)  # SitToStand → Sitting if too short
+    clean_transitions(labels, 3, 1)  # StandToSit → Standing if too short
+    
+    labels = pad_transition_starts(labels, 2, pad_frames=30)  # SitToStand
+    labels = pad_transition_ends(labels, 3, pad_frames=75)  # SitToStand
+
+    # ───────────────────────────────────────────────────────────
+    # Final sanity check and debug
+    # ───────────────────────────────────────────────────────────
+    print("\n[🧪 generate_posture_core Debug]")
+    print(f"  Sitting     (0): {np.sum(labels == 0)}")
+    print(f"  Standing    (1): {np.sum(labels == 1)}")
+    print(f"  SitToStand  (2): {np.sum(labels == 2)}")
+    print(f"  StandToSit  (3): {np.sum(labels == 3)}")
+
+    return labels
+
+
+
+def classify_transition_types_from_posture(ht_smoothed, posture_core, sit_thresh=0.20, stand_thresh=0.80):
+    """
+    Classifies each frame between posture thresholds as SitToStand or StandToSit based on prior state.
+
+    Returns:
+        Array with:
+        0 = Not a transition
+        2 = SitToStand
+        3 = StandToSit
+    """
+    T = len(ht_smoothed)
+    labels = np.zeros(T, dtype=int)
+
+    prev_state = None
+    for t in range(T):
+        h = ht_smoothed[t]
+
+        if h <= sit_thresh:
+            prev_state = 0  # Sitting
+            continue
+        elif h >= stand_thresh:
+            prev_state = 1  # Standing
+            continue
+
+        # In between thresholds → transition
+        if prev_state == 0:
+            labels[t] = 2  # SitToStand
+        elif prev_state == 1:
+            labels[t] = 3  # StandToSit
+        else:
+            labels[t] = 0  # Unknown
+
+    return labels
+
+
+def plot_posture_logic_vs_gt(
+    gt_labels,
+    logic_labels,
+    title="Posture Prediction vs GT",
+    ht_smoothed=None,
+    smooth_velocity_flat=None,
+    ang_vel_sm_l=None,
+    ang_vel_sm_r=None,
+    show=True
+):
+    """
+    Plots GT vs logic posture labels, optionally with ht_smoothed overlay.
+    Always trims all series to the shortest length.
+    """
+    # Find safe T across all input series
+    lengths = [len(gt_labels), len(logic_labels)]
+    if ht_smoothed is not None:
+        lengths.append(len(ht_smoothed))
+    if smooth_velocity_flat is not None:
+        lengths.append(len(smooth_velocity_flat))
+    
+    if ang_vel_sm_l is not None:
+        lengths.append(len(ang_vel_sm_l))
+                     
+    if ang_vel_sm_r is not None:
+        lengths.append(len(ang_vel_sm_r))
+
+    T = min(lengths)
+    time = np.arange(T)
+
+    print(f"[Plot Check] T={T} | gt_labels={len(gt_labels)}, logic_labels={len(logic_labels)}, "
+          f"ht_smoothed={len(ht_smoothed) if ht_smoothed is not None else 'N/A'}, "
+          f"smooth_velocity_flat={len(smooth_velocity_flat) if smooth_velocity_flat is not None else 'N/A'}")
+
+    plt.figure(figsize=(15, 5))
+
+    # Plot GT and logic labels
+    plt.plot(time, gt_labels[:T], label="GT", linestyle='-', linewidth=1.2, alpha=0.7)
+    plt.plot(time, logic_labels[:T], label="Predicted", linestyle='--', linewidth=1.2, alpha=0.7)
+
+    # Optionally overlay height
+    if ht_smoothed is not None:
+        plt.plot(time, ht_smoothed[:T], label="ht_smoothed", color='gray', alpha=0.3)
+
+    # Optionally overlay smooth velocity
+    if smooth_velocity_flat is not None:
+        plt.plot(time, smooth_velocity_flat[:T], label="smooth_velocity", color='orange', alpha=0.3)
+                     
+    # Optionally overlay ang_vel_sm_l
+    if ang_vel_sm_l is not None:
+        plt.plot(time, ang_vel_sm_l[:T], label="ang_vel_l", color='green', alpha=0.2)
+                     
+    # Optionally overlay ang_vel_sm_r
+    if ang_vel_sm_r is not None:
+        plt.plot(time, ang_vel_sm_r[:T], label="ang_vel_r", color='blue', alpha=0.2)
+
+    plt.title(title)
+    plt.xlabel("Frame")
+    plt.ylabel("Label")
+    plt.yticks(np.arange(0, 4), ["Sitting", "Stand-like", "SitToStand", "StandToSit"])
+    plt.legend(loc="upper right")
+    plt.grid(True)
+    plt.tight_layout()
+
+    if show:
+        plt.show()
+
+
+def full_inference_integration(
+    ht_smoothed,
+    smooth_velocity,
+    softmax_probs_locomotion,
+    softmax_probs_turn_dir,
+    stand_thresh=0.7,
+    sit_thresh=0.21,
+    ground_truth_main=None,
+    standing_vel_thresh=0.65, #0.65
+    turn_conf_thresh=0.65, #0.65
+    loco_conf_thresh=0.10 #0.10
+):
+    """
+    Combines deterministic posture and thresholded model confidences into 9-class motor states.
+
+    Class Map:
+        0: Sitting     1: Standing    2: SitToStand    3: StandToSit
+        4: TIP_L       5: TIP_R       6: TW_L          7: TW_R
+        8: Walking
+    """
+    T = len(ht_smoothed)
+    hybrid_labels = np.full(T, -1, dtype=int)
+
+    # --- Step 1: Deterministic posture classification
+    posture_labels = generate_posture_core(
+        ht_smoothed,
+        smooth_velocity,
+        sit_thresh=sit_thresh,
+        stand_thresh=stand_thresh,
+        min_transition_length=5
+    )
+
+    print("\n[🧪 Posture Label Distribution]")
+    for val, name in zip([0, 1, 2, 3], ["Sitting", "Standing", "SitToStand", "StandToSit"]):
+        print(f"  {name:12s}: {np.sum(posture_labels == val)}")
+
+    # --- Step 2: Extract positive-class probabilities
+    walk_prob = softmax_probs_locomotion[:, 1]     # Walking (class 1)
+    turnL_prob = softmax_probs_turn_dir[:, 1]      # Turn Left (class 1)
+    turnR_prob = softmax_probs_turn_dir[:, 2]      # Turn Right (class 2)
+
+    # --- Step 3: Merge posture + model inference
+    for t in range(T):
+        post = posture_labels[t]
+
+        if post == 0:
+            hybrid_labels[t] = 0  # Sitting
+            continue
+        elif post == 2:
+            hybrid_labels[t] = 2  # SitToStand
+            continue
+        elif post == 3:
+            hybrid_labels[t] = 3  # StandToSit
+            continue
+
+        vel = smooth_velocity[t]
+        is_tip = vel < standing_vel_thresh
+
+        is_turnL = turnL_prob[t] > turn_conf_thresh
+        is_turnR = turnR_prob[t] > turn_conf_thresh
+        is_walk  = walk_prob[t]  > loco_conf_thresh
+
+        if is_turnL:
+            hybrid_labels[t] = 4 if is_tip else 6  # TIP_L or TW_L
+        elif is_turnR:
+            hybrid_labels[t] = 5 if is_tip else 7  # TIP_R or TW_R
+        elif is_walk:
+            hybrid_labels[t] = 8  # Walking
+        else:
+            hybrid_labels[t] = 1  # Default to Standing if none apply
+
+    # --- Step 4: Debug comparison with ground truth
+    if ground_truth_main is not None:
+        trimmed_gt = ground_truth_main[:T]
+        exact = np.sum(trimmed_gt == hybrid_labels)
+        print("\n[🧪 Hybrid Label vs Ground Truth]")
+        print(f"  Exact Match: {exact} / {T} ({exact / T:.2%})")
+
+        for i, name in zip(range(9), [
+            "Sitting", "Standing", "SitToStand", "StandToSit",
+            "TIP_L", "TIP_R", "TW_L", "TW_R", "Walking"
+        ]):
+            count = np.sum(hybrid_labels == i)
+            print(f"  Class {i}: {name:12s} — {count}")
+
+        for label, name in zip([2, 3], ['SitToStand', 'StandToSit']):
+            starts = np.where(np.diff((hybrid_labels == label).astype(int)) == 1)[0] + 1
+            ends = np.where(np.diff((hybrid_labels == label).astype(int)) == -1)[0] + 1
+            if hybrid_labels[0] == label:
+                starts = np.insert(starts, 0, 0)
+            if hybrid_labels[-1] == label:
+                ends = np.append(ends, T)
+            print(f"\n🧪 {name} Segments Found: {len(starts)}")
+            for s, e in zip(starts, ends):
+                print(f"  - From {s} to {e} (len={e - s})")
+
+    return hybrid_labels, posture_labels
+
+
+def validate_transition_continuity(labels, window=10):
+    """
+    Validates SitToStand and StandToSit transitions by checking if a valid target class follows.
+    """
+    corrected = labels.copy()
+    T = len(labels)
+    for i in range(T):
+        if labels[i] == 2 and not np.any(labels[i:i+window] == 8):
+            corrected[i] = 1  # SitToStand must lead to Walking
+        elif labels[i] == 3 and not np.any(labels[i:i+window] == 0):
+            corrected[i] = 1  # StandToSit must lead to Sitting
+    return corrected
+
+
+def detect_transitions_from_height(ht_smoothed, stand_thresh=0.80, sit_thresh=0.21, min_duration=5):
+    """
+    Detects SitToStand (2) and StandToSit (3) transitions using threshold crossing and direction.
+    Labels:
+        -1: Use DL prediction
+         2: SitToStand
+         3: StandToSit
+    """
+    T = len(ht_smoothed)
+    labels = np.full(T, -1, dtype=int)
+    state = None
+    transition_start = None
+
+    for t in range(T):
+        h = ht_smoothed[t]
+
+        if state is None:
+            if h >= stand_thresh:
+                state = 'standing'
+            elif h <= sit_thresh:
+                state = 'sitting'
+
+        if state == 'sitting':
+            if h > sit_thresh:
+                if transition_start is None:
+                    transition_start = t
+                if h >= stand_thresh and (t - transition_start) >= min_duration:
+                    labels[transition_start:t+1] = 2  # SitToStand
+                    state = 'standing'
+                    transition_start = None
+            else:
+                transition_start = None  # reset if no valid transition
+
+        elif state == 'standing':
+            if h < stand_thresh:
+                if transition_start is None:
+                    transition_start = t
+                if h <= sit_thresh and (t - transition_start) >= min_duration:
+                    labels[transition_start:t+1] = 3  # StandToSit
+                    state = 'sitting'
+                    transition_start = None
+            else:
+                transition_start = None  # reset if no valid transition
+
+    return labels
+
+def map_to_posture_logic_view(full_labels):
+    """
+    Reduce 9-class motor states into 4 posture logic classes.
+    """
+    mapped = np.full_like(full_labels, -1)
+
+    # Sitting
+    mapped[full_labels == 0] = 0
+
+    # Stand-like (Standing, Walking, Turning*)
+    stand_like_classes = [1, 4, 5, 6, 7, 8]
+    mapped[np.isin(full_labels, stand_like_classes)] = 1
+
+    # Transitions
+    mapped[full_labels == 2] = 2  # SitToStand
+    mapped[full_labels == 3] = 3  # StandToSit
+
+    return mapped
+
+
+def join_close_segments(binary_array, join_thresh=15):
+
+    joined = binary_array.copy()
+    labeled_array, num_features = label(joined)
+
+    for i in range(1, num_features):
+        end = np.where(labeled_array == i)[0][-1]
+        start_next = np.where(labeled_array == i + 1)[0]
+        if len(start_next) == 0:
+            continue
+        start_next = start_next[0]
+
+        if (start_next - end) <= join_thresh:
+            joined[end:start_next] = 1
+
+    return joined
+
+def smooth_probs(probs, window_size=5):
+    from scipy.signal import medfilt
+    return medfilt(probs, kernel_size=window_size)
+
+def drop_short_segments(binary_array, min_len=30):
+    cleaned = binary_array.copy()
+    labeled_array, num_features = label(cleaned)
+
+    for i in range(1, num_features + 1):
+        indices = np.where(labeled_array == i)[0]
+        if len(indices) < min_len:
+            cleaned[indices] = 0
+    return cleaned
+
+
+def smooth_softmax_probs(probs, window=11):
+    """
+    Apply temporal smoothing (e.g., moving average) across softmax outputs.
+    Args:
+        probs (np.ndarray): (T, C)
+        window (int): Smoothing window size
+    Returns:
+        np.ndarray: Smoothed probabilities (T, C)
+    """
+    return np.apply_along_axis(lambda m: uniform_filter1d(m, size=window, mode='nearest'), axis=0, arr=probs)
+
+def extract_segments(binary_array):
+    segments = []
+    in_segment = False
+    for i, val in enumerate(binary_array):
+        if val and not in_segment:
+            start = i
+            in_segment = True
+        elif not val and in_segment:
+            end = i
+            segments.append((start, end))
+            in_segment = False
+    if in_segment:
+        segments.append((start, len(binary_array)))
+    return segments
+
+def compute_iou(seg1, seg2):
+    start1, end1 = seg1
+    start2, end2 = seg2
+    intersection = max(0, min(end1, end2) - max(start1, start2))
+    union = max(end1, end2) - min(start1, start2)
+    return intersection / union if union > 0 else 0
+
+def evaluate_segment_matches(pred_binary, gt_binary, iou_thresh=0.5):
+    pred_segments = extract_segments(pred_binary)
+    gt_segments = extract_segments(gt_binary)
+
+    matched_gt = set()
+    true_positives = 0
+
+    for pred_seg in pred_segments:
+        for i, gt_seg in enumerate(gt_segments):
+            if i in matched_gt:
+                continue
+            if compute_iou(pred_seg, gt_seg) >= iou_thresh:
+                true_positives += 1
+                matched_gt.add(i)
+                break
+
+    false_positives = len(pred_segments) - true_positives
+    false_negatives = len(gt_segments) - true_positives
+
+    precision = 100 * true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0.0
+    recall = 100 * true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {
+        "TP": true_positives,
+        "FP": false_positives,
+        "FN": false_negatives,
+        "Precision": precision,
+        "Recall": recall,
+        "F1": f1,
+        "Pred Segments": len(pred_segments),
+        "GT Segments": len(gt_segments)
+    }
+
+def fill_gaps(series):
+    # Mask zero regions, then interpolate linearly
+    series = np.asarray(series)
+    series_masked = np.where(series == 0, np.nan, series)
+    series_filled = pd.Series(series_masked).interpolate(method='linear').fillna(method='bfill').fillna(method='ffill').to_numpy()
+    return series_filled
+
+
+def clean_posture_transitions(
+    posture_labels,
+    min_transition_length=5,
+    pad_sts_start=30,
+    pad_stsit_end=75
+):
+    """
+    Clean short SitToStand / StandToSit segments and pad them for smoother overlap.
+    Use this on inline RT posture_state_series.
+    """
+    T = len(posture_labels)
+
+    def clean_transitions(label_array, target_class, fallback_class):
+        mask = (label_array == target_class).astype(int)
+        starts = np.where(np.diff(mask) == 1)[0] + 1
+        ends = np.where(np.diff(mask) == -1)[0] + 1
+
+        if mask[0] == 1:
+            starts = np.insert(starts, 0, 0)
+        if mask[-1] == 1:
+            ends = np.append(ends, T)
+
+        for s, e in zip(starts, ends):
+            if (e - s) < min_transition_length:
+                label_array[s:e] = fallback_class
+                print(f"🧹 Reverting {target_class} → {fallback_class} from {s} to {e} (too short)")
+
+    def pad_transition_starts(label_array, target_class, pad_frames):
+        mask = (label_array == target_class).astype(int)
+        starts = np.where(np.diff(mask) == 1)[0] + 1
+        if mask[0] == 1:
+            starts = np.insert(starts, 0, 0)
+        for s in starts:
+            s_pad = max(0, s - pad_frames)
+            label_array[s_pad:s] = target_class
+        return label_array
+
+    def pad_transition_ends(label_array, target_class, pad_frames):
+        mask = (label_array == target_class).astype(int)
+        ends = np.where(np.diff(mask) == -1)[0] + 1
+        if mask[-1] == 1:
+            ends = np.append(ends, T)
+        for e in ends:
+            e_pad = min(T, e + pad_frames)
+            label_array[e:e_pad] = target_class
+        return label_array
+
+    clean_transitions(posture_labels, 2, 0)  # SitToStand → Sitting
+    clean_transitions(posture_labels, 3, 1)  # StandToSit → Standing
+
+    posture_labels = pad_transition_starts(posture_labels, 2, pad_sts_start)
+    posture_labels = pad_transition_ends(posture_labels, 3, pad_stsit_end)
+
+    print("\n[🧪 Posture Cleanup Debug]")
+    print(f"  Sitting     (0): {np.sum(posture_labels == 0)}")
+    print(f"  Standing    (1): {np.sum(posture_labels == 1)}")
+    print(f"  SitToStand  (2): {np.sum(posture_labels == 2)}")
+    print(f"  StandToSit  (3): {np.sum(posture_labels == 3)}")
+
+    return posture_labels
+
+def plot_simple_state_series(states, title="State Series"):
+    T = len(states)
+    time = np.arange(T)
+
+    plt.figure(figsize=(15, 3))
+    plt.plot(time, states, linestyle='-', marker='', alpha=0.7)
+    plt.title(title)
+    plt.xlabel("Frame")
+    plt.ylabel("State ID")
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+    
+def plot_simple_states_twoseries(stateone, statetwo, title="State Series"):
+    len1, len2 = len(stateone), len(statetwo)
+
+    # 🔑 Force same length by trimming
+    if len1 < len2:
+        statetwo = statetwo[:len1]
+    elif len2 < len1:
+        stateone = stateone[:len2]
+
+    T = len(stateone)
+    time = np.arange(T)
+
+    plt.figure(figsize=(15, 3))
+    plt.plot(
+        time, stateone,
+        linestyle='-', marker='', alpha=0.6,
+        color='tab:blue', label='State One'
+    )
+    plt.plot(
+        time, statetwo,
+        linestyle='--', marker='', alpha=0.8,
+        color='tab:orange', label='State Two'
+    )
+    plt.title(title)
+    plt.xlabel("Frame")
+    plt.ylabel("State ID")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def pad_or_clip(array, target_len, axis=0):
+    diff = target_len - array.shape[axis]
+    if diff > 0:
+        if array.ndim == 1:
+            pad_val = array[-1]
+            array = np.pad(array, (0, diff), constant_values=pad_val)
+        else:
+            pad_val = array[-1:]
+            pad_chunk = np.repeat(pad_val, diff, axis=axis)
+            array = np.concatenate([array, pad_chunk], axis=axis)
+        print(f"[⚡️] Padded by {diff} to match GT.")
+    elif diff < 0:
+        array = array[:target_len]
+        print(f"[⚡️] Clipped by {-diff} to match GT.")
+    return array
+
+def plot_native_vs_combined(file_path):
+    """
+    Visualize raw native state labels vs. combined ground_truth_main,
+    and highlight frames where NO native state is active.
+    """
+    required_keys = [
+        'Sittings', 'Standings', 'SitToStands', 'StandToSits',
+        'Turning1L', 'Turning1R', 'Turning2L', 'Turning2R',
+        'Walkings', 'FOGs', 'predictionFOG'
+    ]
+
+    with h5py.File(file_path, 'r') as hdf5_file:
+        missing_keys = [key for key in required_keys if key not in hdf5_file]
+        if missing_keys:
+            raise ValueError(f"Missing keys: {', '.join(missing_keys)}")
+
+        # Load raw states
+        sittings = hdf5_file['Sittings'][:].flatten()
+        standings = hdf5_file['Standings'][:].flatten()
+        sit_to_stands = hdf5_file['SitToStands'][:].flatten()
+        stand_to_sits = hdf5_file['StandToSits'][:].flatten()
+        turning1l = hdf5_file['Turning1L'][:].flatten()
+        turning1r = hdf5_file['Turning1R'][:].flatten()
+        turning2l = hdf5_file['Turning2L'][:].flatten()
+        turning2r = hdf5_file['Turning2R'][:].flatten()
+        walkings = hdf5_file['Walkings'][:].flatten()
+
+        num_samples = len(sittings)
+
+        # Build robust combined label with priority
+        ground_truth_main = -1 * np.ones(num_samples, dtype=int)
+
+        ground_truth_main[sit_to_stands == 1] = 2
+        ground_truth_main[stand_to_sits == 1] = 3
+        ground_truth_main[turning1l == 1] = 4
+        ground_truth_main[turning1r == 1] = 5
+        ground_truth_main[turning2l == 1] = 6
+        ground_truth_main[turning2r == 1] = 7
+        ground_truth_main[walkings == 1] = 8
+        ground_truth_main[standings == 1] = 1
+        ground_truth_main[sittings == 1] = 0  # Sitting last for explicit
+
+        # Compute no-state mask: frames where ALL raw states are zero
+        native_states = np.vstack([
+            sittings, standings, sit_to_stands, stand_to_sits,
+            turning1l, turning1r, turning2l, turning2r, walkings
+        ])
+        no_state_mask = (native_states.sum(axis=0) == 0)
+
+        print(f"⚡️ Frames with NO native state active: {np.sum(no_state_mask)} / {num_samples}")
+
+        # Mark these gaps in the combined series for the plot
+        combined_with_gaps = ground_truth_main.copy()
+        combined_with_gaps[no_state_mask] = -1  # Show gaps as -1 for visual dip
+
+    # Plot all rows
+    labels = [
+        'Sitting (0)',
+        'Standing (1)',
+        'SitToStand (2)',
+        'StandToSit (3)',
+        'Turning1L (4)',
+        'Turning1R (5)',
+        'Turning2L (6)',
+        'Turning2R (7)',
+        'Walking (8)'
+    ]
+
+    fig, axs = plt.subplots(native_states.shape[0] + 1, 1, figsize=(15, 2 * (native_states.shape[0] + 1)), sharex=True)
+
+    for idx, ax in enumerate(axs[:-1]):
+        ax.plot(native_states[idx], drawstyle='steps-post')
+        ax.set_ylabel(labels[idx])
+        ax.set_ylim(-0.1, 1.1)
+
+    # Combined label + gap highlights
+    axs[-1].plot(ground_truth_main, drawstyle='steps-post', color='k', label='GT main')
+    axs[-1].plot(combined_with_gaps, drawstyle='steps-post', color='red', alpha=0.6, label='Gap highlight')
+    axs[-1].set_ylabel('Combined ground_truth_main')
+    axs[-1].set_xlabel('Frame')
+    axs[-1].legend(loc='upper right')
+
+    plt.tight_layout()
+    plt.show()
+    
+def downsample_labels(labels, target_hz=12, input_hz=30):
+    """
+    Downsamples discrete labels by local majority vote.
+
+    Args:
+        labels (array-like): The input labels at input_hz.
+        target_hz (int): Desired output Hz.
+        input_hz (int): Original sampling Hz.
+
+    Returns:
+        np.ndarray: Downsampled labels.
+    """
+    labels = np.asarray(labels)
+    factor = int(round(input_hz / target_hz))
+    downsampled = []
+
+    for i in range(0, len(labels), factor):
+        window = labels[i:i+factor]
+        if len(window) == 0:
+            continue
+        # Majority vote
+        common_label = Counter(window).most_common(1)[0][0]
+        downsampled.append(common_label)
+
+    return np.array(downsampled)
+
+def downsample_continuous(signal, target_hz=12, input_hz=30, method='mean'):
+    """
+    Downsample a continuous signal (1D or 2D) by computing the mean per window.
+    Keeps last axis for 2D arrays like softmax probs.
+    """
+    signal = np.asarray(signal)
+    factor = int(round(input_hz / target_hz))
+    if factor < 1:
+        raise ValueError("Target Hz must be lower than input Hz")
+
+    downsampled = []
+    for i in range(0, len(signal), factor):
+        window = signal[i:i+factor]
+        if len(window) == 0:
+            continue
+        if method == 'mean':
+            avg = np.mean(window, axis=0)  # ✅ keep last axis!
+        elif method == 'median':
+            avg = np.median(window, axis=0)
+        else:
+            raise ValueError("Unsupported method")
+        downsampled.append(avg)
+
+    return np.array(downsampled)
+
+def downsample_labels_priority(labels, target_hz=12, input_hz=30):
+    """
+    Downsamples labels using priority order instead of majority vote.
+
+    If any higher-priority label exists in the window, it will be kept.
+    """
+    labels = np.asarray(labels)
+    factor = int(round(input_hz / target_hz))
+    downsampled = []
+
+    # Higher priority labels come first
+    priority_order = ['stair up', 'stair down', 'slope up', 'slope down', 'transitioning', 'level', 'unknown']
+
+    for i in range(0, len(labels), factor):
+        window = labels[i:i + factor]
+        found = next((p for p in priority_order if p in window), 'unknown')
+        downsampled.append(found)
+
+    return np.array(downsampled)
+
+
+def plot_surface_states(expanded_surface_states, title="Surface Classification Over Time"):
+    state_to_num = {
+        'level': 0,
+        'slope up': 1,
+        'slope down': 2,
+        'stair up': 3,
+        'stair down': 4,
+        'transitioning': 5,
+        'unknown': -1,
+    }
+
+    cleaned_states = [str(s).strip().lower() for s in expanded_surface_states]
+    y_vals = np.array([state_to_num.get(s, -1) for s in cleaned_states])
+    x_vals = np.arange(len(y_vals))
+
+    valid_mask = y_vals >= 0
+
+    plt.figure(figsize=(15, 4))
+    plt.plot(x_vals[valid_mask], y_vals[valid_mask], drawstyle='steps-post', label="Valid States", linewidth=1.2)
+    plt.plot(x_vals[~valid_mask], [-1] * np.sum(~valid_mask), 'rx', label="Unknown")
+
+    # Add vertical lines at transition points
+    for i in range(1, len(y_vals)):
+        if y_vals[i] != y_vals[i - 1] and y_vals[i] >= 0 and y_vals[i - 1] >= 0:
+            plt.axvline(x=i, color='gray', alpha=0.3, linestyle='--', linewidth=0.5)
+
+    plt.yticks(
+        [v for v in state_to_num.values() if v >= 0],
+        [k for k, v in state_to_num.items() if v >= 0]
+    )
+    plt.title(title)
+    plt.xlabel("Frame")
+    plt.ylabel("Surface")
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_surface_state_log(
+    surface_state_log,
+    ht_smoothed,
+    walking_mask=None,
+    title="Surface Classification vs Height"
+):
+    """
+    Plots surface classification over time with optional walking mask.
+    """
+    from matplotlib import cm
+
+    surface_types = list(set(surface_state_log))
+    surface_types.sort()
+
+    surface_colors = {
+        'level': 'gray',
+        'slope_up': 'orange',
+        'slope_down': 'blue',
+        'stair_up': 'green',
+        'stair_down': 'red',
+        'unknown': 'black'
+    }
+
+    surface_indices = {
+        s: [i for i, label in enumerate(surface_state_log) if label == s]
+        for s in surface_types
+    }
+
+    plt.figure(figsize=(15, 4))
+    plt.plot(ht_smoothed, label='ht_smoothed', linewidth=1, alpha=0.7, color='black')
+
+    for surface, indices in surface_indices.items():
+        plt.scatter(
+            indices,
+            [ht_smoothed[i] for i in indices],
+            label=surface,
+            s=4,
+            alpha=0.7,
+            color=surface_colors.get(surface, 'black')
+        )
+
+    if walking_mask is not None:
+        walk_indices = [i for i, w in enumerate(walking_mask) if w]
+        plt.scatter(
+            walk_indices,
+            [ht_smoothed[i] for i in walk_indices],
+            label='walking_mask',
+            s=4,
+            alpha=0.5,
+            color='cyan'
+        )
+
+    plt.title(title)
+    plt.xlabel("Frame")
+    plt.ylabel("Smoothed Height (m)")
+    plt.legend(loc="upper right", fontsize='small', ncol=3)
+    plt.tight_layout()
+    plt.grid(True)
+    plt.show()
+
+    
+def compute_average_cadence(step_events, sample_rate_hz=30):
+    if len(step_events) < 2:
+        return 0.0  # Not enough steps to calculate cadence
+
+    # Convert frame indices to time in seconds
+    step_times_sec = np.array(step_events) / sample_rate_hz
+
+    # Compute time between steps
+    step_intervals = np.diff(step_times_sec)  # in seconds
+
+    # Compute cadence for each interval (steps per minute)
+    cadences = 60 / step_intervals
+
+    # Return average cadence
+    return np.mean(cadences)
+    
+    
+def main(
+    model_type='onnx',
+    model_folder="V2model_testing/",
+    file_path="ml_inputs/ml_inputs/DataFile_test2_machinelearning2_fog.hdf5",
+    sequence_length=30
+):
+    """
+    ✅ Main function: load models, stream RT inference, merge votes, align GT.
+    """
+
+    # ────────────────
+    # ✅ User constants
+    # ────────────────
+    user_seated_ht = 1.192
+    user_standing_ht = 1.582
+    user_walk_vel_ref = 0.679
+    
+    tolerance = 15
+
+    log_memory_usage("Initial")
+
+    # ────────────────
+    # Load GT
+    # ────────────────
+    plot_native_vs_combined(file_path)
+
+    ground_truth_main, ground_truth_predfog = generate_ground_truth_labels(file_path)
+
+    # ────────────────
+    # Load models
+    # ────────────────
+    models = load_all_models(model_folder)
+    print(f" Loaded {len(models)} models")
+    log_memory_usage("Models Loaded")
+
+    stride, seq_len = 30, 30
+
+    # -------------------------
+    # ✅ Run model in True Edge RT mode
+    # -------------------------
+
+    max_frame_idx = -1  # Track how far we actually fill
+
+    for model_name, model in models:
+        print(f"\n▶️ Running True Edge RT for: {model_name}")
+
+        (
+            motor_state_series_single,
+            pred_fog_series_single,
+            softmax_probs_locomotion,
+            softmax_probs_turn_direction,
+            predfog_probs,
+            posture_labels,
+            num_frames_rt,
+            ht_smoothed,
+            smooth_velocity,
+            ang_vel_sm_l,
+            ang_vel_sm_r,
+            surface_states,
+            step_events
+        ) = stream_data_and_run_inference(
+            #model_type='onnx',
+            model=model,
+            sequence_length=seq_len,
+            stride=stride,
+            file_path=file_path,
+            user_seated_ht=user_seated_ht,
+            user_standing_ht=user_standing_ht,
+            user_walk_vel_ref=user_walk_vel_ref,
+            ground_truth_main=ground_truth_main,
+            sample_rate_hz=30
+        )
+        
+        print(f"[DEBUG] step_event_series shape: {step_events.shape}")
+
+        # Diagnostic printout before expansion and downsampling
+        print("\n[STEP EVENTS SUMMARY]")
+        surface_counter = Counter(step_events)
+        for event, count in surface_counter.items():
+            print(f"  {event}: {count} frames")
+        
+        
+        # Plot step events across the time series
+        plt.figure(figsize=(12, 3))
+        plt.plot(step_events, label="Step Events", drawstyle="steps-post", color="darkgreen")
+        plt.title("Detected Step Events Over Time")
+        plt.xlabel("Frame Index")
+        plt.ylabel("Step Event (0 or 1)")
+        plt.ylim(-0.1, 1.1)
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+        
+        print(f"[DEBUG] Total step events: {len(step_events)}")
+        print(f"[DEBUG] Length of motor_state_series_single: {len(motor_state_series_single)}")
+
+        valid_step_events = [s for s in step_events if 0 <= s < len(motor_state_series_single)]
+        print(f"[DEBUG] Valid step events: {len(valid_step_events)}")
+
+        step_events_during_walk = [s for s in valid_step_events if motor_state_series_single[s] == 8]
+        print(f"[DEBUG] Step events during walking: {len(step_events_during_walk)}")
+        print(f"[DEBUG] Walking step indices: {step_events_during_walk}")
+
+        avg_cadence = compute_average_cadence(step_events_during_walk, sample_rate_hz=30)
+        print(f"[METRIC] Average cadence during walking: {avg_cadence:.1f} steps/min")
+
+
+        # Diagnostic printout before expansion and downsampling
+        print("\n[SURFACE STATE LOG SUMMARY]")
+        surface_counter = Counter(surface_states)
+        for state, count in surface_counter.items():
+            print(f"  {state}: {count} frames")
+
+        # Optional: view as percentage
+        total_frames = sum(surface_counter.values())
+        print("\n[Surface % Distribution]")
+        for state, count in surface_counter.items():
+            pct = (count / total_frames) * 100
+            print(f"  {state}: {pct:.2f}%")
+        
+        def expand_surface_state_log(surface_log, num_frames, stride):
+            state_votes = [[] for _ in range(num_frames)]
+            for i, state in enumerate(surface_log):
+                start = i * stride
+                end = min(start + stride, num_frames)
+                for j in range(start, end):
+                    state_votes[j].append(state)
+            return [
+                Counter(states).most_common(1)[0][0] if states else "unknown"
+                for states in state_votes
+            ]
+
+#         surface_states = expand_surface_state_log(surface_states, num_frames_rt, stride)
+        
+        print("\n[SURFACE STATE LOG - AFTER EXPANSION - SUMMARY]")
+        surface_counter = Counter(surface_states)
+        for state, count in surface_counter.items():
+            print(f"  {state}: {count} frames")
+
+        ground_truth_main = downsample_labels(ground_truth_main, target_hz=12, input_hz=30)
+        ground_truth_predfog = downsample_labels(ground_truth_predfog, target_hz=12, input_hz=30)
+        
+        motor_state_series_single= downsample_labels(motor_state_series_single, target_hz=12, input_hz=30)
+        pred_fog_series_single= downsample_labels(pred_fog_series_single, target_hz=12, input_hz=30)
+        posture_labels= downsample_labels(posture_labels, target_hz=12, input_hz=30)
+#         surface_states= downsample_labels(surface_states, target_hz=12, input_hz=30)
+#         #surface_states = downsample_labels_priority(surface_states, target_hz=12, input_hz=30)
+        
+        print("\n[SURFACE STATE LOG - AFTER DOWNSAMPLING - SUMMARY]")
+        surface_counter = Counter(surface_states)
+        for state, count in surface_counter.items():
+            print(f"  {state}: {count} frames")
+        
+        ht_smoothed = downsample_continuous(ht_smoothed, target_hz=12, input_hz=30)
+        smooth_velocity = downsample_continuous(smooth_velocity, target_hz=12, input_hz=30)
+        ang_vel_sm_l = downsample_continuous(ang_vel_sm_l, target_hz=12, input_hz=30)
+        ang_vel_sm_r = downsample_continuous(ang_vel_sm_r, target_hz=12, input_hz=30)
+        softmax_probs_locomotion = downsample_continuous(softmax_probs_locomotion, target_hz=12, input_hz=30)
+        softmax_probs_turn_direction = downsample_continuous(softmax_probs_turn_direction, target_hz=12, input_hz=30)
+        predfog_probs = downsample_continuous(predfog_probs, target_hz=12, input_hz=30)
+        num_frames_rt = len(softmax_probs_locomotion)
+        
+        print(f"  ✔️ RT shapes → Loco:{np.array(softmax_probs_locomotion).shape} | "
+              f"Turn:{np.array(softmax_probs_turn_direction).shape} | "
+              f"PredFOG:{np.array(predfog_probs).shape} | "
+              f"Posture:{np.array(posture_labels).shape}")
+
+        
+        predfog_preds = np.array(pred_fog_series_single)
+        softmax_probs_predfog = np.array(predfog_probs)
+        
+
+    # ✅ Improved pad_or_clip with debug
+    def pad_or_clip(arr, target_len, name="array"):
+        arr_len = len(arr)
+        diff = target_len - arr_len
+
+        print(f"[pad_or_clip] {name}: len={arr_len}, target={target_len}, diff={diff}")
+
+        if diff > 0:
+            arr = np.pad(
+                arr,
+                ((0, diff),) if arr.ndim == 1 else ((0, diff), (0, 0)),
+                mode='edge'
+            )
+            print(f"[pad_or_clip] Padded {name} to length {len(arr)}")
+        elif diff < 0:
+            arr = arr[:target_len]
+            print(f"[pad_or_clip] Clipped {name} to length {len(arr)}")
+        else:
+            print(f"[pad_or_clip] No change for {name}")
+        return arr
+
+    # ✅ Final length match to GT — with debug prints
+    final_len = len(ground_truth_main)
+    print(f"\n[✔️ Length Check] Ground Truth Length: {final_len}")
+
+    final_labels = pad_or_clip(np.array(motor_state_series_single), final_len, name="motor_state_series_single")
+    predfog_preds = pad_or_clip(np.array(pred_fog_series_single), final_len, name="pred_fog_series_single")
+    predfog_probs = pad_or_clip(np.array(predfog_probs), final_len, name="predfog_probs")
+    softmax_probs_locomotion = pad_or_clip(np.array(softmax_probs_locomotion), final_len, name="softmax_probs_locomotion")
+    softmax_probs_turn_direction = pad_or_clip(np.array(softmax_probs_turn_direction), final_len, name="softmax_probs_turn_direction")
+
+    print(f"\n✅ Final shapes after pad/clip: "
+          f"Labels:{final_labels.shape} | predFOG:{predfog_preds.shape} | "
+          f"Loco:{softmax_probs_locomotion.shape} | Turn:{softmax_probs_turn_direction.shape}")
+
+    assert len(final_labels) == len(ground_truth_main), (
+        f"❌ Length mismatch: final_labels ({len(final_labels)}) vs GT ({len(ground_truth_main)})"
+    )
+    
+    # for each unique GT label, compute stats for the height and velocity
+    ht_smoothed_aligned = pad_or_clip(ht_smoothed, len(ground_truth_main))
+    smooth_velocity_aligned = pad_or_clip(smooth_velocity, len(ground_truth_main))
+
+    print(f"✅ After pad/clip: ht_smoothed={len(ht_smoothed_aligned)}, smooth_velocity={len(smooth_velocity_aligned)}, GT={len(ground_truth_main)}")
+
+    # 2️⃣ Loop through GT labels
+    gt_labels = np.unique(ground_truth_main)
+
+    for label in gt_labels:
+        mask = ground_truth_main == label
+
+        ht_vals = ht_smoothed_aligned[mask]
+        vel_vals = smooth_velocity_aligned[mask]
+
+        if len(ht_vals) > 0:
+            print(f"\n[GT CLASS {label}]")
+            print(f"  HT  → min: {np.min(ht_vals):.4f}, max: {np.max(ht_vals):.4f}, median: {np.median(ht_vals):.4f}")
+            print(f"  VEL → min: {np.min(vel_vals):.4f}, max: {np.max(vel_vals):.4f}, median: {np.median(vel_vals):.4f}")
+        else:
+            print(f"[GT CLASS {label}] → No frames found!")
+
+
+    # ─────────────────────────────────────────────────────────
+    # Trim and Binarize Ground Truth predFOG to match RT stream
+    # ─────────────────────────────────────────────────────────
+
+    # Trust final predFOG states — match GT to them
+    ground_truth_predfog = (ground_truth_predfog[:len(predfog_preds)] > 0.1).astype(int)
+
+    # RT-safe: use the same for plots
+    softmax_probs_predfog = predfog_probs  # optional for hist plot
+    predicted_predfog = predfog_preds
+
+    plot_simple_state_series(motor_state_series_single)
+    plot_simple_state_series(ground_truth_main)
+    
+    plot_simple_states_twoseries(motor_state_series_single, ground_truth_main)
+    
+    plot_simple_state_series(predfog_preds)
+    plot_simple_state_series(ground_truth_predfog)
+    
+    
+    # ─────────────────────────────────────────────────────────
+    # Visual Debugging - Probability Distributions
+    # ─────────────────────────────────────────────────────────
+
+    plt.hist(predfog_probs[ground_truth_predfog == 1], bins=50, alpha=0.5, label="PredFOG")
+    plt.hist(predfog_probs[ground_truth_predfog == 0], bins=50, alpha=0.5, label="No PredFOG")
+    plt.title("PreFOG Probability Distribution")
+    plt.xlabel("Predicted Probability")
+    plt.ylabel("Count")
+    plt.legend(); plt.grid(True); plt.show()
+
+    # ─────────────────────────────────────────────────────────
+    # Threshold Sweeps (for debug and tuning)
+    # ─────────────────────────────────────────────────────────
+
+    print("\n🔍 Threshold Sweep for predFOG Output:")
+    for thresh in np.arange(0.05, 0.95, 0.05):
+        preds = (predfog_probs >= thresh).astype(int)
+        precision = precision_score(ground_truth_predfog, preds, zero_division=0)
+        recall = recall_score(ground_truth_predfog, preds, zero_division=0)
+        f1 = f1_score(ground_truth_predfog, preds, zero_division=0)
+        print(f"[predFOG] Threshold {thresh:.2f} → P: {precision:.4f}, R: {recall:.4f}, F1: {f1:.4f}")
+
+    # ─────────────────────────────────────────────────────────
+    # Print Prediction Summaries and Shape Checks
+    # ─────────────────────────────────────────────────────────
+
+    print("predFOG predicted class counts:", np.unique(predicted_predfog, return_counts=True))
+    print("Ground truth predFOG values:", np.unique(ground_truth_predfog, return_counts=True))
+
+    try:
+        print("predFOG predictions (first 100):", predicted_predfog[:100])
+    except Exception as e:
+        print("Preview Error:", e)
+
+    assert ground_truth_predfog.shape == predicted_predfog.shape, \
+        f"predFOG GT shape {ground_truth_predfog.shape} != prediction shape {predicted_predfog.shape}"
+
+    # ─────────────────────────────────────────────────────────
+    # Final Label Distribution
+    # ─────────────────────────────────────────────────────────
+
+    print("\n📊 Final Label Distribution (Post-Duration Enforcement):")
+    unique_labels, label_counts = np.unique(final_labels, return_counts=True)
+    for lbl, count in zip(unique_labels, label_counts):
+        print(f"  Class {lbl}: {count} frames")
+
+    # ✅ Trim GT to match final RT predictions
+    ground_truth_main_trimmed, final_labels = adjust_length_to_match(ground_truth_main, final_labels)
+    ground_truth_predfog_trimmed, predicted_predfog = adjust_length_to_match(ground_truth_predfog, predicted_predfog)
+
+    print(f"\n📊 Final Label Distribution:")
+    unique_final, counts_final = np.unique(final_labels, return_counts=True)
+    for cls, cnt in zip(unique_final, counts_final):
+        print(f"  Class {cls}: {cnt} frames")
+
+    print(f"Ground Truth Classes: {np.unique(ground_truth_main_trimmed)}")
+
+    ground_truth_predfog_trimmed = (ground_truth_predfog_trimmed == 1).astype(int)
+    predicted_predfog = (predicted_predfog == 1).astype(int)
+
+    # ✅ Final sanity for plotting & downstream metrics
+    T = len(final_labels)
+    print(f"T = {T}, final_labels shape: {final_labels.shape}, GT shape: {ground_truth_main_trimmed.shape}")
+
+
+    # ────────────────────────────────────────────────
+    # ✂️ Trim GT if just slightly longer than needed
+    # ────────────────────────────────────────────────
+    gt_trimmed = ground_truth_main
+    if ground_truth_main.shape[0] > T:
+        diff = ground_truth_main.shape[0] - T
+        if diff <= 5:
+            gt_trimmed = ground_truth_main[:T]
+            print(f"✂️ Trimmed ground_truth_main from {ground_truth_main.shape[0]} to {T}")
+        else:
+            print(f"❌ Large mismatch: GT length = {ground_truth_main.shape[0]}, Expected = {T}")
+            gt_trimmed = None
+
+    # ────────────────────────────────────────────────
+    # 🧠 Extract motor labels from trimmed GT
+    # ────────────────────────────────────────────────
+    motor_labels = None
+    if gt_trimmed is not None:
+        if gt_trimmed.ndim == 2 and gt_trimmed.shape[1] >= 13:
+            motor_labels = np.argmax(gt_trimmed[:, :13], axis=-1)
+        elif gt_trimmed.ndim == 2 and gt_trimmed.shape[1] == 1:
+            motor_labels = gt_trimmed[:, 0].astype(int)
+        elif gt_trimmed.ndim == 1:
+            motor_labels = gt_trimmed.astype(int)
+
+    if motor_labels is None or len(motor_labels) != T:
+        print(f"⚠️ Cannot use motor_labels: got {None if motor_labels is None else len(motor_labels)}")
+        motor_labels = None
+
+    # ────────────────────────────────────────────────
+    # 📈 Locomotion Output Plot (TW + Walk) + GT
+    # ────────────────────────────────────────────────
+    plt.figure(figsize=(12, 3))
+    plt.plot(softmax_probs_locomotion[:, 0], label="Not Walking", alpha=0.8)
+    plt.plot(softmax_probs_locomotion[:, 1], label="Walking", alpha=0.8)
+
+    gt_colors_1 = {'TW': 'purple', 8: 'green'}
+
+    if isinstance(motor_labels, np.ndarray) and motor_labels.ndim == 1:
+        # TW_L or TW_R
+        tw_mask = np.isin(motor_labels, [6, 7])
+        plt.fill_between(np.arange(T), 0, 1, where=tw_mask, alpha=0.15, color=gt_colors_1['TW'], label="GT: TW")
+
+        # Walk only (8)
+        walk_mask = (motor_labels == 8)
+        plt.fill_between(np.arange(T), 0, 1, where=walk_mask, alpha=0.15, color=gt_colors_1[8], label="GT: Walk")
+
+    plt.title("Locomotion Output (Smoothed) + GT")
+    plt.ylim(-0.05, 1.05)
+    plt.ylabel("Probability")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # ────────────────────────────────────────────────
+    # 🧮 Compute locomotion predictions
+    # ────────────────────────────────────────────────
+    if softmax_probs_locomotion.ndim == 2 and softmax_probs_locomotion.shape[1] == 2:
+        predicted_locomotion = np.argmax(softmax_probs_locomotion, axis=-1)
+    else:
+        print("⚠️ Unexpected shape for softmax_probs_locomotion:", softmax_probs_locomotion.shape)
+        predicted_locomotion = None
+
+    # ────────────────────────────────────────────────
+    # ✅ Generate GT locomotion binary (TW or Walk = 1)
+    # ❗ Exclude FOG from walking GT
+    # ────────────────────────────────────────────────
+    if (
+        isinstance(motor_labels, np.ndarray)
+        and motor_labels.ndim == 1
+        and isinstance(ground_truth_predfog, np.ndarray)
+        and ground_truth_predfog.shape[0] >= T
+    ):
+        gt_is_walk = (motor_labels == 8) & (ground_truth_predfog[:T] == 0)
+    else:
+        print("⚠️ Unexpected motor_labels or ground_truth_predfog input")
+        gt_is_walk = None
+
+
+    # ────────────────────────────────────────────────
+    # 📊 Matching Metrics — All Walk Types (6,7,8)
+    # ────────────────────────────────────────────────
+    if (
+        isinstance(predicted_locomotion, np.ndarray)
+        and isinstance(gt_is_walk, np.ndarray)
+        and predicted_locomotion.shape == gt_is_walk.shape
+    ):
+        pred_is_walk = predicted_locomotion == 1
+
+        # Framewise match
+        match = pred_is_walk == gt_is_walk
+        match_percent = 100 * np.mean(match)
+        print(f"\n✅ Walking vs Not Walking Match (All Walk Types): {match_percent:.2f}% ({np.sum(match)} / {len(match)} frames)")
+
+        walking_precision = 100 * np.mean(gt_is_walk[pred_is_walk]) if np.any(pred_is_walk) else 0.0
+        print(f"🚶 Walking Precision: {walking_precision:.2f}% ({np.sum(gt_is_walk & pred_is_walk)} / {np.sum(pred_is_walk)} predicted walking frames)")
+
+        walking_recall = 100 * np.mean(pred_is_walk[gt_is_walk]) if np.any(gt_is_walk) else 0.0
+        print(f"🔎 Walking Recall: {walking_recall:.2f}% ({np.sum(gt_is_walk & pred_is_walk)} / {np.sum(gt_is_walk)} GT walking frames)")
+    else:
+        print("❌ Cannot compute overall walking metrics due to shape mismatch or missing data.")
+
+    # ────────────────────────────────────────────────
+    # 📊 Segment-Level Walking Evaluation (All Types)
+    # ────────────────────────────────────────────────
+    iou_thresholds = [0.3, 0.5, 0.7]
+    if (
+        isinstance(predicted_locomotion, np.ndarray)
+        and isinstance(gt_is_walk, np.ndarray)
+        and predicted_locomotion.shape == gt_is_walk.shape
+    ):
+        pred_binary_walk = (predicted_locomotion == 1).astype(int)
+        gt_binary_walk = gt_is_walk.astype(int)
+
+        for thresh in iou_thresholds:
+            print(f"\n📊 Segment-level Walking Evaluation (All Walk Types, IoU ≥ {thresh}):")
+            walk_metrics = evaluate_segment_matches(pred_binary_walk, gt_binary_walk, iou_thresh=thresh)
+            print(f"   🟢 TP: {walk_metrics['TP']}   🔴 FP: {walk_metrics['FP']}   🔵 FN: {walk_metrics['FN']}")
+            print(f"   📈 Precision: {walk_metrics['Precision']:.2f}%")
+            print(f"   📉 Recall   : {walk_metrics['Recall']:.2f}%")
+            print(f"   🎯 F1 Score : {walk_metrics['F1']:.2f}%")
+    else:
+        print("❌ Cannot compute segment-level walking (all types) evaluation.")
+
+    # ────────────────────────────────────────────────
+    # 📊 Additional: Pure Forward Walking Only (GT = 8)
+    # ────────────────────────────────────────────────
+    if (
+        isinstance(predicted_locomotion, np.ndarray)
+        and isinstance(motor_labels, np.ndarray)
+        and predicted_locomotion.shape == motor_labels.shape
+    ):
+        gt_is_fwd_walk = motor_labels == 8
+        pred_is_walk = predicted_locomotion == 1
+
+        match = pred_is_walk == gt_is_fwd_walk
+        match_percent = 100 * np.mean(match)
+        print(f"\n✅ Walking Match (Forward Walking Only): {match_percent:.2f}% ({np.sum(match)} / {len(match)} frames)")
+
+        precision_fwd = 100 * np.mean(gt_is_fwd_walk[pred_is_walk]) if np.any(pred_is_walk) else 0.0
+        recall_fwd = 100 * np.mean(pred_is_walk[gt_is_fwd_walk]) if np.any(gt_is_fwd_walk) else 0.0
+
+        print(f"🚶 Precision (FWD Only): {precision_fwd:.2f}% ({np.sum(gt_is_fwd_walk & pred_is_walk)} / {np.sum(pred_is_walk)} predicted)")
+        print(f"🔎 Recall    (FWD Only): {recall_fwd:.2f}% ({np.sum(gt_is_fwd_walk & pred_is_walk)} / {np.sum(gt_is_fwd_walk)} GT)")
+
+        # Segment-based for FWD only
+        pred_binary_walk = (predicted_locomotion == 1).astype(int)
+        gt_binary_fwd = gt_is_fwd_walk.astype(int)
+
+        for thresh in iou_thresholds:
+            print(f"\n📊 Segment-level Evaluation (FWD Walk Only, IoU ≥ {thresh}):")
+            fwd_metrics = evaluate_segment_matches(pred_binary_walk, gt_binary_fwd, iou_thresh=thresh)
+            print(f"   🟢 TP: {fwd_metrics['TP']}   🔴 FP: {fwd_metrics['FP']}   🔵 FN: {fwd_metrics['FN']}")
+            print(f"   📈 Precision: {fwd_metrics['Precision']:.2f}%")
+            print(f"   📉 Recall   : {fwd_metrics['Recall']:.2f}%")
+            print(f"   🎯 F1 Score : {fwd_metrics['F1']:.2f}%")
+    else:
+        print("❌ Cannot compute FWD walking evaluation due to shape mismatch or missing labels.")
+
+
+    # ─────────────────────────────────────────────────────
+    # 📈 2. Turn Direction Output Plot + GT for TIP_L, TIP_R, TW_L, TW_R
+    # ─────────────────────────────────────────────────────
+    plt.figure(figsize=(12, 3))
+    plt.plot(softmax_probs_turn_direction[:, 0], label="No Turn", alpha=0.8)
+    plt.plot(softmax_probs_turn_direction[:, 1], label="Turn Left", alpha=0.8)
+    plt.plot(softmax_probs_turn_direction[:, 2], label="Turn Right", alpha=0.8)
+
+    gt_colors_2 = {4: 'blue', 5: 'red'}
+
+    if isinstance(motor_labels, np.ndarray) and motor_labels.ndim == 1:
+        for label_val, label_name in zip([4, 5], ["Turn_Left", "Turn_Right"]):
+            gt_mask = (motor_labels == label_val)
+            plt.fill_between(
+                np.arange(len(gt_mask)),
+                0, 1,
+                where=gt_mask,
+                alpha=0.15,
+                color=gt_colors_2[label_val],
+                label=f"GT: {label_name}"
+            )
+
+
+    plt.title("Turn Direction Output (Smoothed) + GT")
+    plt.ylim(-0.05, 1.05)
+    plt.ylabel("Probability")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+
+    # ─────────────────────────────────────────────────────
+    # ✅ Turn Direction Precision/Recall (FOG-excluded)
+    # ─────────────────────────────────────────────────────
+
+    # Step 1: Get predicted turn direction class per frame (0: No Turn, 1: Left, 2: Right)
+    if softmax_probs_turn_direction.ndim == 2 and softmax_probs_turn_direction.shape[1] == 3:
+        predicted_turn_dir = np.argmax(softmax_probs_turn_direction, axis=-1)
+    else:
+        print("⚠️ Unexpected shape for softmax_probs_turn_direction:", softmax_probs_turn_direction.shape)
+        predicted_turn_dir = None
+
+    # Step 2: Compute GT masks and apply FOG exclusion on predicted side only
+    if (
+        isinstance(predicted_turn_dir, np.ndarray)
+        and isinstance(motor_labels, np.ndarray)
+        and predicted_turn_dir.shape[0] == motor_labels.shape[0]
+        and ground_truth_predfog_trimmed.shape[0] == motor_labels.shape[0]
+    ):
+        fog_mask = (ground_truth_predfog_trimmed == 0)
+
+        # ----- Turn Left -----
+        pred_is_left = (predicted_turn_dir == 1) & fog_mask
+        gt_is_left  = motor_labels == 4
+        true_positive_left = pred_is_left & gt_is_left
+
+        precision_left = 100 * np.sum(true_positive_left) / np.sum(pred_is_left) if np.sum(pred_is_left) > 0 else 0.0
+        recall_left = 100 * np.sum(true_positive_left) / np.sum(gt_is_left) if np.sum(gt_is_left) > 0 else 0.0
+
+        print(f"↪️ Turn Left Precision: {precision_left:.2f}% ({np.sum(true_positive_left)} / {np.sum(pred_is_left)} predicted)")
+        print(f"↩️ Turn Left Recall   : {recall_left:.2f}% ({np.sum(true_positive_left)} / {np.sum(gt_is_left)} GT)")
+
+        # ----- Turn Right -----
+        pred_is_right = (predicted_turn_dir == 2) & fog_mask
+        gt_is_right = motor_labels == 5
+        true_positive_right = pred_is_right & gt_is_right
+
+        precision_right = 100 * np.sum(true_positive_right) / np.sum(pred_is_right) if np.sum(pred_is_right) > 0 else 0.0
+        recall_right = 100 * np.sum(true_positive_right) / np.sum(gt_is_right) if np.sum(gt_is_right) > 0 else 0.0
+
+        print(f"↩️ Turn Right Precision: {precision_right:.2f}% ({np.sum(true_positive_right)} / {np.sum(pred_is_right)} predicted)")
+        print(f"↪️ Turn Right Recall   : {recall_right:.2f}% ({np.sum(true_positive_right)} / {np.sum(gt_is_right)} GT)")
+
+    else:
+        print("❌ Cannot compute Turn Direction metrics: shape mismatch or missing inputs.")
+
+    # ─────────────────────────────────────────────────────
+    # ✅ Turn Direction Segment-Level Evaluation (IoU)
+    # ─────────────────────────────────────────────────────
+    def binarize_class(arr, target_class):
+        """Binary array where class == target_class"""
+        return (arr == target_class).astype(int)
+
+    # ─────────────────────────────────────────────────────
+    # 📊 Segment-Level Turn Direction Evaluation (IoU sweep)
+    # ─────────────────────────────────────────────────────
+
+    iou_thresholds = [0.3, 0.5, 0.7]
+
+    if (
+        isinstance(predicted_turn_dir, np.ndarray)
+        and isinstance(motor_labels, np.ndarray)
+        and predicted_turn_dir.shape[0] == motor_labels.shape[0]
+        and ground_truth_predfog_trimmed.shape[0] == motor_labels.shape[0]
+    ):
+        fog_mask = (ground_truth_predfog_trimmed == 0)
+
+        pred_bin_left = ((predicted_turn_dir == 1) & fog_mask).astype(int)
+        gt_bin_left = (motor_labels == 4).astype(int)
+
+        pred_bin_right = ((predicted_turn_dir == 2) & fog_mask).astype(int)
+        gt_bin_right = (motor_labels == 5).astype(int)
+
+        for thresh in iou_thresholds:
+            print(f"\n📊 Segment-level Turn Left Evaluation (IoU ≥ {thresh}):")
+            left_metrics = evaluate_segment_matches(pred_bin_left, gt_bin_left, iou_thresh=thresh)
+            print(f"   🟢 TP: {left_metrics['TP']}   🔴 FP: {left_metrics['FP']}   🔵 FN: {left_metrics['FN']}")
+            print(f"   📈 Precision: {left_metrics['Precision']:.2f}%")
+            print(f"   📉 Recall   : {left_metrics['Recall']:.2f}%")
+            print(f"   🎯 F1 Score : {left_metrics['F1']:.2f}%")
+
+            print(f"\n📊 Segment-level Turn Right Evaluation (IoU ≥ {thresh}):")
+            right_metrics = evaluate_segment_matches(pred_bin_right, gt_bin_right, iou_thresh=thresh)
+            print(f"   🟢 TP: {right_metrics['TP']}   🔴 FP: {right_metrics['FP']}   🔵 FN: {right_metrics['FN']}")
+            print(f"   📈 Precision: {right_metrics['Precision']:.2f}%")
+            print(f"   📉 Recall   : {right_metrics['Recall']:.2f}%")
+            print(f"   🎯 F1 Score : {right_metrics['F1']:.2f}%")
+
+
+    # ─────────────────────────────────────────────────────
+    # 📈 3. PredFOG Output Plot + GT (class 12)
+    # ─────────────────────────────────────────────────────
+    plt.figure(figsize=(12, 3))
+
+    # Plot predicted probability (if softmax/sigmoid)
+    if softmax_probs_predfog.ndim == 1:
+        plt.plot(softmax_probs_predfog, label="predFOG (raw)", color='black', linewidth=2)
+    elif softmax_probs_predfog.shape[-1] == 2:
+        plt.plot(softmax_probs_predfog[:, 1], label="predFOG (class 1)", color='black', linewidth=2)
+    else:
+        plt.plot(softmax_probs_predfog, label="predFOG", color='black', linewidth=2)
+
+    # Overlay GT and thresholded pred
+    #plt.plot(predicted_predfog * 0.95, label="PredFOG (thresholded)", linestyle='--', color='red', linewidth=1)
+    plt.plot(ground_truth_predfog_trimmed * 1.0, label="GT: FOG", linestyle='--', color='green', linewidth=1)
+    plt.plot(smooth_velocity * 0.95, label="Vel", linestyle='--', color='grey', linewidth=1)
+    plt.axhline(y=0.35, color='blue', linestyle=':', linewidth=1, label='Threshold (0.3)')
+
+
+    plt.title("PredFOG Output (Smoothed) + GT")
+    plt.ylim(-0.05, 1.05)
+    plt.ylabel("Probability")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+    # ─────────────────────────────────────────────────────
+    # ✅ predFOG Precision / Recall Metrics (Frame-level)
+    # ─────────────────────────────────────────────────────
+    if (
+        isinstance(predicted_predfog, np.ndarray)
+        and isinstance(ground_truth_predfog_trimmed, np.ndarray)
+        and predicted_predfog.shape[0] == ground_truth_predfog_trimmed.shape[0]
+    ):
+        pred = (predicted_predfog == 1)
+        gt = (ground_truth_predfog_trimmed == 1)
+
+        true_positives = pred & gt
+        precision_fog = 100 * np.sum(true_positives) / np.sum(pred) if np.sum(pred) > 0 else 0.0
+        recall_fog = 100 * np.sum(true_positives) / np.sum(gt) if np.sum(gt) > 0 else 0.0
+
+        print(f"🟥 predFOG Precision: {precision_fog:.2f}% ({np.sum(true_positives)} / {np.sum(pred)} predicted)")
+        print(f"🟩 predFOG Recall   : {recall_fog:.2f}% ({np.sum(true_positives)} / {np.sum(gt)} GT)")
+    else:
+        print("❌ Cannot compute predFOG metrics: shape mismatch or missing data.")
+
+    # ─────────────────────────────────────────────────────
+    # ✅ predFOG Segment-wise Evaluation (IoU-based)
+    # ─────────────────────────────────────────────────────
+
+    # 🔍 Call the segment-based evaluator and print results
+    seg_eval = evaluate_segment_matches(
+        (predicted_predfog == 1),
+        (ground_truth_predfog_trimmed == 1),
+        iou_thresh=0.5
+    )
+
+    for thresh in [0.3, 0.5, 0.7]:
+        results = evaluate_segment_matches(predicted_predfog, ground_truth_predfog_trimmed, iou_thresh=thresh)
+        print(f"\n📊 Segment-level predFOG Evaluation (IoU ≥ {thresh}):")
+        print(f"   🟢 TP: {results['TP']}   🔴 FP: {results['FP']}   🔵 FN: {results['FN']}")
+        print(f"   📈 Precision: {results['Precision']:.2f}%")
+        print(f"   📉 Recall   : {results['Recall']:.2f}%")
+        print(f"   🎯 F1 Score : {results['F1']:.2f}%")
+
+
+    def eval_metrics(y_true, y_pred):
+        return (
+            accuracy_score(y_true, y_pred),
+            precision_score(y_true, y_pred, average='weighted', zero_division=0),
+            recall_score(y_true, y_pred, average='weighted', zero_division=0),
+            f1_score(y_true, y_pred, average='weighted', zero_division=0)
+        )
+
+    # Strict metrics
+    acc_main, prec_main, rec_main, f1_main = eval_metrics(ground_truth_main_trimmed, final_labels)
+
+    acc_predfog = accuracy_score(ground_truth_predfog_trimmed, predicted_predfog)
+    prec_predfog = precision_score(ground_truth_predfog_trimmed, predicted_predfog, average='binary', zero_division=0)
+    rec_predfog = recall_score(ground_truth_predfog_trimmed, predicted_predfog, average='binary', zero_division=0)
+    f1_predfog = f1_score(ground_truth_predfog_trimmed, predicted_predfog, average='binary', zero_division=0)
+
+    # Fuzzy accuracy for main (matches allowed within ±tolerance regardless of class)
+    acc_main_fuzzy = evaluate_with_temporal_leniency(final_labels, ground_truth_main_trimmed, tolerance)
+
+    # True fuzzy per-class metrics using mask-based evaluation
+    # For main motor states — use your explicit keys
+    class_index_to_label_main = {
+        0: 'Sitting',
+        1: 'Standing',
+        2: 'SitToStand',
+        3: 'StandToSit',
+        4: 'Turn_Left',
+        5: 'Turn_Right',
+        8: 'Walking'
+    }
+    classes_to_eval_main = sorted(class_index_to_label_main.keys())
+
+    main_fuzzy_results = fuzzy_classwise_metrics(
+        final_labels, ground_truth_main_trimmed, tolerance, classes_to_eval=classes_to_eval_main
+    )
+
+    # For predFOG — just binary: 0, 1
+    classes_to_eval_predfog = [0, 1]
+    predfog_fuzzy_results = fuzzy_classwise_metrics(
+        predicted_predfog, ground_truth_predfog_trimmed, tolerance, classes_to_eval=classes_to_eval_predfog
+    )
+
+    # Extract macro-averaged main fuzzy metrics (excluding padding class if any)
+    prec_main_fuzzy = np.mean([r['precision'] for r in main_fuzzy_results])
+    rec_main_fuzzy = np.mean([r['recall'] for r in main_fuzzy_results])
+    f1_main_fuzzy = np.mean([r['f1'] for r in main_fuzzy_results])
+
+    # Extract class 1 metrics for predFOG
+    prec_predfog_fuzzy = predfog_fuzzy_results[1]['precision']
+    rec_predfog_fuzzy = predfog_fuzzy_results[1]['recall']
+    f1_predfog_fuzzy = predfog_fuzzy_results[1]['f1']
+
+    # Final printout
+    print(f"\n📊 Metrics for {model_name} (Final Labels):")
+    print(f"{'Metric':<20} {'Strict':<15} {'Fuzzy':<15}")
+    print(f"{'-'*50}")
+    print(f"{'Accuracy':<20} {acc_main:.4f} {acc_main_fuzzy:.4f}")
+    print(f"{'Precision':<20} {prec_main:.4f} {prec_main_fuzzy:.4f}")
+    print(f"{'Recall':<20} {rec_main:.4f} {rec_main_fuzzy:.4f}")
+    print(f"{'F1 Score':<20} {f1_main:.4f} {f1_main_fuzzy:.4f}")
+
+    print(f"\n🧊 Metrics for {model_name} (predFOG):")
+    print(f"{'Metric':<20} {'Strict':<15} {'Fuzzy':<15}")
+    print(f"{'-'*50}")
+    print(f"{'Accuracy':<20} {acc_predfog:.4f} {'-':<15}")
+    print(f"{'Precision':<20} {prec_predfog:.4f} {prec_predfog_fuzzy:.4f}")
+    print(f"{'Recall':<20} {rec_predfog:.4f} {rec_predfog_fuzzy:.4f}")
+    print(f"{'F1 Score':<20} {f1_predfog:.4f} {f1_predfog_fuzzy:.4f}")     
+    
+    target_names_motor_states = [
+        'Sitting', 'Standing', 'SitToStand', 'StandToSit',
+        'Turn_Left', 'Turn_Right', 'Walking'
+    ]
+
+    plot_confusion_matrix(ground_truth_main_trimmed, final_labels, target_names_motor_states, f"{model_name} - Final")
+    plot_confusion_matrix(ground_truth_predfog_trimmed, predicted_predfog, ["Non-PredFOG", "Pred FOG"], f"{model_name} - PredFOG")
+
+    print(classification_report(
+        ground_truth_main_trimmed,
+        final_labels,
+        target_names=[
+            'Sitting',
+            'Standing',
+            'SitToStand',
+            'StandToSit',
+            'Turn_Left',
+            'Turn_Right',
+            'Walking'
+        ],
+        labels=[0, 1, 2, 3, 4, 5, 8], # explicitly match valid class IDs
+        zero_division=0
+    ))
+
+    print("\nClassification Report (PredFOG):\n" + classification_report(
+        ground_truth_predfog_trimmed, predicted_predfog,
+        labels=[0, 1],
+        target_names=['Non-PredFOG', 'Pred FOG'],
+        zero_division=0))
+    
+    # ✅ Consistent label map
+    class_index_to_label_main = {
+        0: 'Sitting',
+        1: 'Standing',
+        2: 'SitToStand',
+        3: 'StandToSit',
+        4: 'Turn_Left',
+        5: 'Turn_Right',
+        8: 'Walking'
+    }
+
+    classes_to_eval_main = sorted(class_index_to_label_main.keys())
+
+    # ✅ Only call once
+    main_fuzzy_results = fuzzy_classwise_metrics(
+        final_labels, ground_truth_main_trimmed, tolerance, classes_to_eval=classes_to_eval_main
+    )
+
+    # ✅ Reuse result
+    fuzzy_results = main_fuzzy_results
+
+    print("\n🔍 Fuzzy Per-Class Metrics (Final Labels ±15 frames):")
+    for res in fuzzy_results:
+        if isinstance(res['class'], int):
+            label = class_index_to_label_main.get(res['class'], f"Unknown({res['class']})")
+            print(f"{label:<15} A: {res['accuracy']:.2f}, P: {res['precision']:.2f}, "
+                  f"R: {res['recall']:.2f}, F1: {res['f1']:.2f}")
+
+    # ✅ Macro + weighted averages: same
+    macro = next((res for res in fuzzy_results if res['class'] == 'macro_avg'), None)
+    weighted = next((res for res in fuzzy_results if res['class'] == 'weighted_avg'), None)
+
+    # ✅ Safe print
+    if macro:
+        print(f"\n📊 Fuzzy Macro-Averaged Metrics (Final Labels):")
+        print(f"{'Accuracy':<12}: {macro['accuracy']:.2f}")
+        print(f"{'Precision':<12}: {macro['precision']:.2f}")
+        print(f"{'Recall':<12}: {macro['recall']:.2f}")
+        print(f"{'F1 Score':<12}: {macro['f1']:.2f}")
+
+    if weighted:
+        print(f"\n📊 Fuzzy Weighted-Averaged Metrics (Final Labels):")
+        print(f"{'Accuracy':<12}: {weighted['accuracy']:.2f}")
+        print(f"{'Precision':<12}: {weighted['precision']:.2f}")
+        print(f"{'Recall':<12}: {weighted['recall']:.2f}")
+        print(f"{'F1 Score':<12}: {weighted['f1']:.2f}")
+
+
+
+    # 📈 Full length plots
+
+    posture_labels_trimmed = posture_labels[:len(ground_truth_main_trimmed)]
+
+    # Map both
+    gt_posture_logic = map_to_posture_logic_view(ground_truth_main_trimmed)
+    pred_posture_logic = map_to_posture_logic_view(final_labels)
+
+    # Force length match
+    min_len = min(len(gt_posture_logic), len(pred_posture_logic))
+    gt_posture_logic = gt_posture_logic[:min_len]
+    pred_posture_logic = pred_posture_logic[:min_len]
+
+    # Debug unique
+    print(f"GT Posture Logic: {np.unique(gt_posture_logic)}")
+    print(f"Pred Posture Logic: {np.unique(pred_posture_logic)}")
+    
+    downsampled_gt = downsample_labels(ground_truth_main_trimmed, target_hz=12, input_hz=30)
+    downsampled_pred = downsample_labels(final_labels, target_hz=12, input_hz=30)
+
+    # Plot
+    plot_posture_logic_vs_gt(
+        gt_labels=gt_posture_logic,
+        logic_labels=pred_posture_logic,
+        ht_smoothed=ht_smoothed,
+        smooth_velocity_flat=smooth_velocity,
+        ang_vel_sm_l = ang_vel_sm_l,
+        ang_vel_sm_r = ang_vel_sm_r,
+        title=f"{model_name} - Posture Logic vs GT (Full Length)"
+    )
+
+    # Original
+    plot_motor_states_overlay(
+        ground_truth_main_trimmed,
+        final_labels,
+        model_name=f"{model_name} (12Hz)",
+        class_index_to_label_main=class_index_to_label_main
+    )
+    
+    plot_fog_states_overlay(
+        ground_truth_predfog_trimmed,
+        predfog_preds,
+        model_name=model_name,
+        vel=smooth_velocity
+    )
+    
+    plot_surface_states(
+        surface_states,
+        title=f"{model_name} - Surface Classification Over Time"
+    )
+    
+#     walking_mask = (ground_truth_main[:len(surface_states)] == 8)
+#     plot_surface_state_log(
+#         surface_state_log=surface_states,
+#         ht_smoothed=ht_smoothed[:len(surface_states)],
+#         walking_mask=walking_mask,
+#         title=f"{model_name} - Surface Classification vs Height"
+#     )
+
+
+    # 🔍 Zoomed-in plots
+    plot_posture_logic_vs_gt(
+        gt_labels=gt_posture_logic[5000:8000],
+        logic_labels=pred_posture_logic[5000:8000],
+        ht_smoothed=ht_smoothed[5000:8000],
+        smooth_velocity_flat=smooth_velocity[5000:8000],
+        #ang_vel_sm_l = ang_vel_sm_l[5000:8000],
+        #ang_vel_sm_r = ang_vel_sm_r[5000:8000],
+        title=f"{model_name} - Posture Logic vs GT (Zoomed)"
+    )
+
+    plot_motor_states_overlay(
+        ground_truth_main_trimmed[5000:8000],
+        final_labels[5000:8000],
+        model_name=f"{model_name} (5000-8000)",
+        class_index_to_label_main=class_index_to_label_main
+    )
+    
+    plot_fog_states_overlay(
+        ground_truth_predfog_trimmed[5000:8000],
+        predfog_preds[5000:8000],
+        model_name=f"{model_name} (Zoomed 5000-8000)",
+        vel=smooth_velocity[5000:8000]
+    )
+    
+#     plot_surface_states(
+#         surface_states[5000:8000],
+#         title=f"{model_name} - Surface Classification Over Time"
+#     )
+
+if __name__ == "__main__":
+    main(model_type='onnx', model_folder="V2model_testing/", file_path="ml_inputs/DataFile_test2_machinelearning2_fog.hdf5")
+    
+######################################################    
